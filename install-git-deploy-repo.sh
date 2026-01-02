@@ -41,10 +41,10 @@ echo ""
 # Configure Git user
 log_step "Configuring Git user information..."
 echo "Enter your Git username (e.g., 'Ondra' or 'Your Name'):"
-read -r GIT_USERNAME
+read -r GIT_USERNAME < /dev/tty
 
 echo "Enter your Git email (e.g., 'your.email@example.com'):"
-read -r GIT_EMAIL
+read -r GIT_EMAIL < /dev/tty
 
 if [ -z "$GIT_USERNAME" ] || [ -z "$GIT_EMAIL" ]; then
     log_error "Username and email cannot be empty"
@@ -66,11 +66,11 @@ SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
 if [ -f "$SSH_KEY_PATH" ]; then
     log_warn "SSH key already exists at $SSH_KEY_PATH"
     echo "Do you want to use the existing key? (y/n)"
-    read -r USE_EXISTING
+    read -r USE_EXISTING < /dev/tty
     
     if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
         echo "Enter a name for the new key (default: id_ed25519_github):"
-        read -r KEY_NAME
+        read -r KEY_NAME < /dev/tty
         KEY_NAME=${KEY_NAME:-id_ed25519_github}
         SSH_KEY_PATH="$HOME/.ssh/$KEY_NAME"
     fi
@@ -109,7 +109,7 @@ echo ""
 # Test GitHub connection in a loop
 while true; do
     echo "Press Enter once you've added the key to GitHub..."
-    read -r
+    read -r < /dev/tty
 
     log_info "Testing GitHub SSH connection..."
     
@@ -129,7 +129,7 @@ while true; do
         echo "  1. Try again"
         echo "  2. Display the public key again"
         echo "  3. Exit"
-        read -r CHOICE
+        read -r CHOICE < /dev/tty
         
         case $CHOICE in
             1)
