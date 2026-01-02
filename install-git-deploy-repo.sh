@@ -1,0 +1,218 @@
+#!/bin/bash
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_step() {
+    echo -e "${BLUE}[STEP]${NC} $1"
+}
+
+echo "================================================"
+echo "  Git & GitHub SSH Setup Script"
+echo "================================================"
+echo ""
+
+# Install Git
+log_step "Installing Git..."
+sudo apt update
+sudo apt install -y git
+log_info "Git installed successfully"
+echo ""
+
+# Configure Git user
+log_step "Configuring Git user information..."
+echo "Enter your Git username (e.g., 'Ondra' or 'Your Name'):"
+read -r GIT_USERNAME
+
+echo "Enter your Git email (e.g., 'your.email@example.com'):"
+read -r GIT_EMAIL
+
+if [ -z "$GIT_USERNAME" ] || [ -z "$GIT_EMAIL" ]; then
+    log_error "Username and email cannot be empty"
+    exit 1
+fi
+
+git config --global user.name "$GIT_USERNAME"
+git config --global user.email "$GIT_EMAIL"
+
+log_info "Git configured with:"
+echo "  Username: $GIT_USERNAME"
+echo "  Email: $GIT_EMAIL"
+echo ""
+
+# Generate SSH key
+log_step "Generating SSH key for GitHub..."
+SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
+
+if [ -f "$SSH_KEY_PATH" ]; then
+    log_warn "SSH key already exists at $SSH_KEY_PATH"
+    echo "Do you want to use the existing key? (y/n)"
+    read -r USE_EXISTING
+    
+    if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
+        echo "Enter a name for the new key (default: id_ed25519_github):"
+        read -r KEY_NAME
+        KEY_NAME=${KEY_NAME:-id_ed25519_github}
+        SSH_KEY_PATH="$HOME/.ssh/$KEY_NAME"
+    fi
+fi
+
+if [ ! -f "$SSH_KEY_PATH" ]; then
+    log_info "Creating new SSH key..."
+    ssh-keygen -t ed25519 -C "$GIT_EMAIL" -f "$SSH_KEY_PATH" -N ""
+    log_info "SSH key generated at: $SSH_KEY_PATH"
+else
+    log_info "Using existing SSH key at: $SSH_KEY_PATH"
+fi
+
+# Start ssh-agent and add key
+log_info "Starting ssh-agent and adding key..."
+eval "$(ssh-agent -s)" > /dev/null
+ssh-add "$SSH_KEY_PATH" 2>/dev/null || log_warn "Key already added to ssh-agent"
+
+echo ""
+log_step "Your SSH public key:"
+echo "================================================"
+cat "${SSH_KEY_PATH}.pub"
+echo "================================================"
+echo ""
+
+log_warn "IMPORTANT: Copy the above SSH key and add it to GitHub"
+echo ""
+echo "To add as a Deploy Key (repo-specific, read-only by default):"
+echo "  1. Go to: https://github.com/BlackTorch-s-r-o/BTRemoteHTTPSpeaker/settings/keys"
+echo "  2. Click 'Add deploy key'"
+echo "  3. Paste the key above"
+echo "  4. Give it a title (e.g., 'torch-$HOSTNAME')"
+echo "  5. Check 'Allow write access' if needed"
+echo ""
+
+# Test GitHub connection in a loop
+while true; do
+    echo "Press Enter once you've added the key to GitHub..."
+    read -r
+
+    log_info "Testing GitHub SSH connection..."
+    
+    if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        log_info "GitHub SSH connection successful!"
+        echo ""
+        break
+    else
+        log_error "GitHub SSH connection failed"
+        echo ""
+        echo "Troubleshooting:"
+        echo "  - Make sure you copied the ENTIRE key (including ssh-ed25519 and email)"
+        echo "  - Verify the key is added to GitHub"
+        echo "  - For private repos, use Deploy Keys or add to your account"
+        echo ""
+        echo "Do you want to:"
+        echo "  1. Try again"
+        echo "  2. Display the public key again"
+        echo "  3. Exit"
+        read -r CHOICE
+        
+        case $CHOICE in
+            1)
+                continue
+                ;;
+            2)
+                echo ""
+                cat "${SSH_KEY_PATH}.pub"
+                echo ""
+                ;;
+            3)
+                log_warn "Exiting. Run this script again when ready."
+                exit 0
+                ;;
+            *)
+                log_warn "Invalid choice, trying connection again..."
+                ;;
+        esac
+    fi
+done
+
+# Optional: Configure SSH config for GitHub
+log_step "Configuring SSH for GitHub..."
+SSH_CONFIG="$HOME/.ssh/config"
+
+if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
+    log_info "Adding GitHub to SSH config..."
+    mkdir -p "$HOME/.ssh"
+    cat >> "$SSH_CONFIG" << EOF
+
+# GitHub configuration
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile $SSH_KEY_PATH
+    IdentitiesOnly yes
+EOF
+    chmod 600 "$SSH_CONFIG"
+    log_info "SSH config updated"
+else
+    log_info "GitHub already configured in SSH config"
+fi
+
+# Clone BTRemoteHTTPSpeaker
+log_step "Cloning BTRemoteHTTPSpeaker repository..."
+REPO_DIR="$HOME/sidsm/Zdrojaky/BTRemoteHTTPSpeaker"
+
+if [ -d "$REPO_DIR" ]; then
+    log_warn "Repository already exists at $REPO_DIR"
+    echo "Do you want to pull latest changes? (y/n)"
+    read -r PULL_UPDATES
+    
+    if [[ "$PULL_UPDATES" =~ ^[Yy]$ ]]; then
+        log_info "Pulling latest changes..."
+        cd "$REPO_DIR"
+        git pull
+        log_info "Repository updated"
+    else
+        log_info "Skipping repository update"
+    fi
+else
+    log_info "Creating directory structure..."
+    mkdir -p "$HOME/sidsm/Zdrojaky"
+    
+    log_info "Cloning repository..."
+    git clone git@github.com:BlackTorch-s-r-o/BTRemoteHTTPSpeaker.git "$REPO_DIR"
+    log_info "Repository cloned to: $REPO_DIR"
+fi
+
+echo ""
+log_info "Setup complete!"
+echo ""
+log_step "Quick reference:"
+echo "  Repository location:"
+echo "    $REPO_DIR"
+echo ""
+echo "  Clone other repos:"
+echo "    git clone git@github.com:BlackTorch-s-r-o/REPO_NAME.git"
+echo ""
+echo "  View Git config:"
+echo "    git config --global --list"
+echo ""
+echo "  View your public key:"
+echo "    cat ${SSH_KEY_PATH}.pub"
+echo ""
+log_info "Happy rest of the setup! 🚀"
