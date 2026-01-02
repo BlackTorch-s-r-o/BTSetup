@@ -99,7 +99,7 @@ echo ""
 log_warn "IMPORTANT: Copy the above SSH key and add it to GitHub"
 echo ""
 echo "To add as a Deploy Key (repo-specific, read-only by default):"
-echo "  1. Go to: https://github.com/BlackTorch-s-r-o/BTRemoteHTTPSpeaker/settings/keys"
+echo "  1. Go to: https://github.com/<your-org>/<your-repo>/settings/keys"
 echo "  2. Click 'Add deploy key'"
 echo "  3. Paste the key above"
 echo "  4. Give it a title (e.g., 'torch-$HOSTNAME')"
@@ -173,41 +173,13 @@ else
     log_info "GitHub already configured in SSH config"
 fi
 
-# Clone BTRemoteHTTPSpeaker
-log_step "Cloning BTRemoteHTTPSpeaker repository..."
-REPO_DIR="$HOME/sidsm/Zdrojaky/BTRemoteHTTPSpeaker"
-
-if [ -d "$REPO_DIR" ]; then
-    log_warn "Repository already exists at $REPO_DIR"
-    echo "Do you want to pull latest changes? (y/n)"
-    read -r PULL_UPDATES
-    
-    if [[ "$PULL_UPDATES" =~ ^[Yy]$ ]]; then
-        log_info "Pulling latest changes..."
-        cd "$REPO_DIR"
-        git pull
-        log_info "Repository updated"
-    else
-        log_info "Skipping repository update"
-    fi
-else
-    log_info "Creating directory structure..."
-    mkdir -p "$HOME/sidsm/Zdrojaky"
-    
-    log_info "Cloning repository..."
-    git clone git@github.com:BlackTorch-s-r-o/BTRemoteHTTPSpeaker.git "$REPO_DIR"
-    log_info "Repository cloned to: $REPO_DIR"
-fi
-
 echo ""
 log_info "Setup complete!"
 echo ""
 log_step "Quick reference:"
-echo "  Repository location:"
-echo "    $REPO_DIR"
 echo ""
-echo "  Clone other repos:"
-echo "    git clone git@github.com:BlackTorch-s-r-o/REPO_NAME.git"
+echo "  Clone the repo:"
+echo "    git clone git@github.com:<your-org>/<your-repo>.git"
 echo ""
 echo "  View Git config:"
 echo "    git config --global --list"
