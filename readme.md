@@ -18,7 +18,7 @@ git clone git@github.com:BlackTorch-s-r-o/BTRemoteHTTPSpeaker.git
 For developing for BlackTorch:
 
 # 1. Create a wireguard public/private key
-curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/setup_hosts.sh | bash
+curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/wg_create_clients.sh | bash
 
 # 2. Append this to the file in /etc/wireguard/<wg_interface>.conf on the VPN server:
 [Peer]
