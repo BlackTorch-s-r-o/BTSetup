@@ -14,17 +14,41 @@ git clone git@github.com:BlackTorch-s-r-o/BTRemoteHTTPSpeaker.git
 
 ```
 
-For developing for BlackTorch, run setup_host.sh
-
 ```bash
+For developing for BlackTorch:
+
+# 1. Create a wireguard public/private key
 curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/setup_hosts.sh | bash
+
+# 2. Append this to the file in /etc/wireguard/<wg_interface>.conf on the VPN server:
+[Peer]
+PublicKey = abc123def456...  # The output from above
+AllowedIPs = <select-some-unused-ipv4>/32
+
+# 3. Create a client config at you host computer in /etc/wireguard (you may need to use sudo du root mode):
+[Interface]
+PrivateKey = <content-of-private.key-from-client>
+Address = <select-some-unused-ipv4>/32
+DNS = 1.1.1.1  # Optional
+
+[Peer]
+PublicKey = <content-of-server-public.key-from-server>
+Endpoint = your-vps-ip:51821 # Or by default 51820
+AllowedIPs = 0.0.0.0/0, ::/0  # Route all traffic through VPN
+PersistentKeepalive = 25
+
+# 4. Run setup_host.sh to create local DNS
+curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/setup_hosts.sh | bash
+
 ```
 
 ## Scripts
 
 - `install-git-deploy-repo.sh` - Git configuration and SSH key setup
 
-- `setup_hosts.sh` - Setups DNS in /etc/hosts for dev infra
+- `wg_create_clients.sh` - Manages Wireguard keys for the local mechine
+
+- `setup_hosts.sh` - Creates DNS in /etc/hosts for dev infra
 
 ---
 
