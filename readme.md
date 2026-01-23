@@ -18,7 +18,7 @@ git clone git@github.com:BlackTorch-s-r-o/BTRemoteHTTPSpeaker.git
 For developing for BlackTorch:
 
 # 1. Create a wireguard public/private key
-curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/wg_create_clients.sh | bash
+bash <(curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/wg_create_client.sh)
 
 # 2. Append this to the file in /etc/wireguard/<wg_interface>.conf on the VPN server:
 [Peer]
@@ -30,6 +30,10 @@ AllowedIPs = <select-some-unused-ipv4>/32
 PrivateKey = <content-of-private.key-from-client>
 Address = <select-some-unused-ipv4>/32
 DNS = 1.1.1.1  # Optional
+PostUp = ip route add 10.7.0.0/24 dev %i # For Jetsons
+PostDown = ip route del 10.7.0.0/24 dev %i # For Jetsons
+Table = off # For Jetsons
+
 
 [Peer]
 PublicKey = <content-of-server-public.key-from-server>
