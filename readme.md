@@ -42,9 +42,12 @@ AllowedIPs = 0.0.0.0/0, ::/0  # Route all traffic through VPN
 PersistentKeepalive = 25
 
 # 4. Run ping_service.sh to make the connection in wg interface reliable:
-curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/ping_service.sh | bash
+curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/ping_service.sh | sudo bash
 
-# 5. Run setup_host.sh to create local DNS
+# 5. Custom commands (devnet up/down/status)
+curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/custom_commands.sh | sudo bash
+
+# 6. Run setup_host.sh to create local DNS
 curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/setup_hosts.sh | bash
 
 ```
@@ -56,6 +59,8 @@ curl -fsSL https://raw.githubusercontent.com/BlackTorch-s-r-o/btsetup/main/setup
 - `wg_create_clients.sh` - Manages Wireguard keys for the local mechine
 
 - `ping_service.sh` - Installs systemd service that pings VPN server every 30 seconds
+
+- `custom_commands.sh` - Creates aliases for managing wireguard interface
 
 - `setup_hosts.sh` - Creates DNS in /etc/hosts for dev infra
 
