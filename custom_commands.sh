@@ -10,7 +10,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-read -r -p "Enter WireGuard interface name [devnet]: " INTERFACE
+read -r -p "Enter WireGuard interface name [devnet]: " INTERFACE < /dev/tty
 INTERFACE="${INTERFACE:-devnet}"
 SCRIPT_PATH="/usr/local/bin/$INTERFACE"
 
