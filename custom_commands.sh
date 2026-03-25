@@ -5,38 +5,39 @@
 
 set -e
 
-INTERFACE="devnet"
-SCRIPT_PATH="/usr/local/bin/devnet"
-
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     echo "ERROR: Please run as root (use sudo)"
     exit 1
 fi
 
-echo "Installing devnet command..."
+read -r -p "Enter WireGuard interface name [devnet]: " INTERFACE
+INTERFACE="${INTERFACE:-devnet}"
+SCRIPT_PATH="/usr/local/bin/$INTERFACE"
+
+echo "Installing $INTERFACE command..."
 
 # Create the script
-cat > "$SCRIPT_PATH" << 'EOF'
+cat > "$SCRIPT_PATH" << EOF
 #!/bin/bash
 
-INTERFACE="devnet"
+INTERFACE="$INTERFACE"
 
-case "$1" in
+case "\$1" in
     up)
-        wg-quick up "$INTERFACE"
+        wg-quick up "\$INTERFACE"
         ;;
     down)
-        wg-quick down "$INTERFACE"
+        wg-quick down "\$INTERFACE"
         ;;
     status)
-        wg show "$INTERFACE"
+        wg show "\$INTERFACE"
         ;;
     restart)
-        wg-quick down "$INTERFACE" 2>/dev/null || true
-        wg-quick up "$INTERFACE"
+        wg-quick down "\$INTERFACE" 2>/dev/null || true
+        wg-quick up "\$INTERFACE"
         ;;
     *)
-        echo "Usage: devnet {up|down|status|restart}"
+        echo "Usage: $INTERFACE {up|down|status|restart}"
         exit 1
         ;;
 esac
@@ -47,14 +48,14 @@ chmod +x "$SCRIPT_PATH"
 echo "✓ Script created at $SCRIPT_PATH"
 
 # Add sudo rule for passwordless execution
-SUDOERS_FILE="/etc/sudoers.d/devnet"
+SUDOERS_FILE="/etc/sudoers.d/$INTERFACE"
 echo "Adding sudoers rule..."
 
 cat > "$SUDOERS_FILE" << EOF
-# Allow wg-quick commands without password for devnet interface
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/wg-quick up devnet
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/wg-quick down devnet
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/wg show devnet
+# Allow wg-quick commands without password for $INTERFACE interface
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/wg-quick up $INTERFACE
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/wg-quick down $INTERFACE
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/wg show $INTERFACE
 EOF
 
 chmod 440 "$SUDOERS_FILE"
@@ -64,8 +65,8 @@ echo ""
 echo "=== Installation Complete ==="
 echo ""
 echo "You can now use:"
-echo "  sudo devnet up       - Bring up the VPN"
-echo "  sudo devnet down     - Bring down the VPN"
-echo "  sudo devnet status   - Show VPN status"
-echo "  sudo devnet restart  - Restart the VPN"
+echo "  sudo $INTERFACE up       - Bring up the VPN"
+echo "  sudo $INTERFACE down     - Bring down the VPN"
+echo "  sudo $INTERFACE status   - Show VPN status"
+echo "  sudo $INTERFACE restart  - Restart the VPN"
 echo ""
