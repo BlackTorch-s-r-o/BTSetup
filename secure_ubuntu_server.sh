@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Ubuntu 24.04 Server Hardening Script
-# Interactive – each step asks for confirmation before running.
+# All questions asked upfront – then runs unattended.
 # Run as root or with sudo.
 # =============================================================================
 
 set -euo pipefail
 
-# ── colours ──────────────────────────────────────────────────────────────────
+# ── colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -15,17 +15,17 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
 ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
-err()     { echo -e "${RED}[ERROR]${RESET} $*"; }
-section() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}"; \
-            echo -e "${BOLD}${CYAN}  $*${RESET}"; \
-            echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"; }
-skip()    { echo -e "${YELLOW}[SKIP]${RESET}  Skipping: $*\n"; }
+err()     { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
+section() {
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  $*${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+}
+skip() { echo -e "${YELLOW}[SKIP]${RESET}  $*"; }
 
-# Ask yes/no – returns 0 for yes, 1 for no
 ask() {
     local prompt="$1"
     while true; do
@@ -40,72 +40,320 @@ ask() {
 }
 
 # ── root check ────────────────────────────────────────────────────────────────
-if [[ $EUID -ne 0 ]]; then
-    err "This script must be run as root (or via sudo)."
-    exit 1
-fi
+[[ $EUID -ne 0 ]] && err "Run as root: sudo ./harden.sh"
 
 # =============================================================================
-# WELCOME
+#  PHASE 1 · PLANNING – all questions upfront
 # =============================================================================
 clear
 echo -e "${BOLD}${CYAN}"
-echo "  ╔═══════════════════════════════════════════════╗"
-echo "  ║   Ubuntu 24.04 LTS – Interactive Hardening   ║"
-echo "  ╚═══════════════════════════════════════════════╝"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║   Ubuntu 24.04 LTS – Server Hardening           ║"
+echo "  ║   Phase 1: Planning                             ║"
+echo "  ╚══════════════════════════════════════════════════╝"
 echo -e "${RESET}"
-warn "Keep a second SSH session open until you verify all changes work."
+warn "Keep a second SSH session open until all changes are verified."
 warn "Have console/VNC access ready as a fallback."
 echo
-
-# =============================================================================
-# 1 · SYSTEM UPDATE
-# =============================================================================
-section "1 · System Update"
-echo "  Runs: apt update && apt upgrade && autoremove"
+echo "  Answer all questions now. The script will then run unattended."
 echo
 
-if ask "Update and upgrade all packages now?"; then
+# ── 1 · System update ─────────────────────────────────────────────────────────
+echo -e "${BOLD}── 1 · System Update ────────────────────────────────────${RESET}"
+echo "  apt update && apt upgrade && autoremove"
+DO_UPDATE=false
+ask "Run system update?" && DO_UPDATE=true
+echo
+
+# ── 2 · Non-root user ─────────────────────────────────────────────────────────
+echo -e "${BOLD}── 2 · Create Non-Root Sudo User ────────────────────────${RESET}"
+DO_USER=false
+NEW_USER=""
+COPY_KEYS=false
+ask "Create a new non-root sudo user?" && DO_USER=true
+
+if $DO_USER; then
+    while true; do
+        echo -en "${BOLD}[?]${RESET} Username: "
+        read -r NEW_USER
+        [[ -n "$NEW_USER" ]] && break
+        echo "  Cannot be empty."
+    done
+    ask "Copy root's authorized_keys to ${NEW_USER}?" && COPY_KEYS=true
+fi
+echo
+
+# ── 3 · SSH hardening ─────────────────────────────────────────────────────────
+echo -e "${BOLD}── 3 · SSH Hardening ────────────────────────────────────${RESET}"
+echo "  Disables password auth, root login, sets session timeouts."
+echo
+DO_SSH=false
+SSH_PORT=22
+SSH_CHANGE_PORT=false
+SSH_RESTRICT_USER=false
+SSH_KEYS=()
+
+ask "Apply SSH hardening?" && DO_SSH=true
+
+if $DO_SSH; then
+    echo
+    # ── Collect SSH public keys ────────────────────────────────────────────────
+    echo -e "  ${BOLD}SSH Public Keys${RESET}"
+    echo "  These will be written to authorized_keys BEFORE password auth is disabled."
+    echo "  Paste each public key (ssh-ed25519 / ssh-rsa / ecdsa …) and press Enter."
+    echo "  Leave blank and press Enter when done."
+    echo
+
+    # Show existing keys already on the system as reference
+    EXISTING_KEYS=()
+    for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [[ -f "$f" ]] && while IFS= read -r line; do
+            [[ "$line" =~ ^(ssh-|ecdsa-) ]] && EXISTING_KEYS+=("$line")
+        done < "$f"
+    done
+
+    if [[ ${#EXISTING_KEYS[@]} -gt 0 ]]; then
+        info "Existing authorized keys found on this system:"
+        for k in "${EXISTING_KEYS[@]}"; do
+            # Print key type and comment only, not the full key blob
+            TYPE=$(echo "$k" | awk '{print $1}')
+            COMMENT=$(echo "$k" | awk '{print $NF}')
+            echo "    ${TYPE} … ${COMMENT}"
+        done
+        echo
+        if ask "Include all existing keys automatically?"; then
+            SSH_KEYS=("${EXISTING_KEYS[@]}")
+            # Write immediately
+            mkdir -p /root/.ssh
+            chmod 700 /root/.ssh
+            touch /root/.ssh/authorized_keys
+            chmod 600 /root/.ssh/authorized_keys
+            for _k in "${EXISTING_KEYS[@]}"; do
+                grep -qxF "$_k" /root/.ssh/authorized_keys || echo "$_k" >> /root/.ssh/authorized_keys
+            done
+            ok "${#SSH_KEYS[@]} existing key(s) confirmed in /root/.ssh/authorized_keys."
+        fi
+        echo
+    fi
+
+    # Ensure authorized_keys exists and is ready before we start accepting keys
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+
+    echo "  Paste additional public keys below (blank line to finish):"
+    while true; do
+        echo -en "${BOLD}[key]${RESET} "
+        read -r KEY_INPUT
+        [[ -z "$KEY_INPUT" ]] && break
+        if echo "$KEY_INPUT" | grep -qE "^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256) "; then
+            SSH_KEYS+=("$KEY_INPUT")
+            # Write immediately to authorized_keys (deduplicated)
+            if grep -qxF "$KEY_INPUT" /root/.ssh/authorized_keys 2>/dev/null; then
+                ok "Key already present (${#SSH_KEYS[@]} total): $(echo "$KEY_INPUT" | awk '{print $1}') … $(echo "$KEY_INPUT" | awk '{print $NF}')"
+            else
+                echo "$KEY_INPUT" >> /root/.ssh/authorized_keys
+                ok "Key saved (${#SSH_KEYS[@]} total): $(echo "$KEY_INPUT" | awk '{print $1}') … $(echo "$KEY_INPUT" | awk '{print $NF}')"
+            fi
+        else
+            warn "Does not look like a valid public key – skipping. Expected format: ssh-ed25519 AAAA... comment"
+        fi
+    done
+
+    if [[ ${#SSH_KEYS[@]} -eq 0 ]]; then
+        echo
+        warn "No SSH keys collected!"
+        warn "Proceeding will disable password auth with NO keys = you will be locked out."
+        if ! ask "Are you absolutely sure you want to continue without any keys?"; then
+            err "Aborted. Add your SSH key and re-run."
+        fi
+    else
+        ok "${#SSH_KEYS[@]} key(s) will be written before SSH is locked down."
+    fi
+    echo
+
+    # ── Port and user restrictions ─────────────────────────────────────────────
+    CURRENT_PORT=$(grep -E "^#?[[:space:]]*Port " /etc/ssh/sshd_config 2>/dev/null \
+        | tail -1 | awk '{print $2}' || echo 22)
+    CURRENT_PORT=${CURRENT_PORT:-22}
+    if ask "Change SSH port (currently ${CURRENT_PORT})?"; then
+        SSH_CHANGE_PORT=true
+        while true; do
+            echo -en "${BOLD}[?]${RESET} New SSH port (1024–65535): "
+            read -r SSH_PORT
+            [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1024 && SSH_PORT <= 65535 )) && break
+            echo "  Invalid port."
+        done
+    fi
+    if [[ -n "$NEW_USER" ]]; then
+        ask "Restrict SSH logins to '${NEW_USER}' only?" && SSH_RESTRICT_USER=true
+    fi
+fi
+echo
+
+# ── 4 · UFW ───────────────────────────────────────────────────────────────────
+echo -e "${BOLD}── 4 · UFW Firewall ─────────────────────────────────────${RESET}"
+echo "  deny all incoming, allow all outgoing, allow SSH"
+DO_UFW=false
+UFW_HTTP=false
+UFW_HTTPS=false
+UFW_CUSTOM_PORTS=()
+ask "Install and configure UFW?" && DO_UFW=true
+
+if $DO_UFW; then
+    ask "Allow HTTP (port 80)?"  && UFW_HTTP=true
+    ask "Allow HTTPS (port 443)?" && UFW_HTTPS=true
+    while ask "Allow a custom port?"; do
+        echo -en "${BOLD}[?]${RESET} Port number: "
+        read -r CP_NUM
+        echo -en "${BOLD}[?]${RESET} Protocol (tcp/udp) [tcp]: "
+        read -r CP_PROTO
+        CP_PROTO="${CP_PROTO:-tcp}"
+        UFW_CUSTOM_PORTS+=("${CP_NUM}/${CP_PROTO}")
+    done
+fi
+echo
+
+# ── 5 · Fail2Ban ──────────────────────────────────────────────────────────────
+echo -e "${BOLD}── 5 · Fail2Ban ─────────────────────────────────────────${RESET}"
+DO_FAIL2BAN=false
+ask "Install and configure Fail2Ban?" && DO_FAIL2BAN=true
+echo
+
+# ── 6 · Automatic updates ─────────────────────────────────────────────────────
+echo -e "${BOLD}── 6 · Automatic Security Updates ──────────────────────${RESET}"
+DO_AUTOUPDATE=false
+ask "Enable automatic security updates?" && DO_AUTOUPDATE=true
+echo
+
+# ── 7 · Kernel hardening ──────────────────────────────────────────────────────
+echo -e "${BOLD}── 7 · Kernel Hardening (sysctl) ────────────────────────${RESET}"
+DO_KERNEL=false
+ask "Apply kernel hardening?" && DO_KERNEL=true
+echo
+
+# ── 8 · Shared memory ─────────────────────────────────────────────────────────
+echo -e "${BOLD}── 8 · Secure Shared Memory ─────────────────────────────${RESET}"
+DO_SHM=false
+ask "Secure /run/shm (noexec, nosuid, nodev)?" && DO_SHM=true
+echo
+
+# ── 9 · Audit logging ─────────────────────────────────────────────────────────
+echo -e "${BOLD}── 9 · Audit Logging (auditd) ───────────────────────────${RESET}"
+DO_AUDIT=false
+ask "Install and enable auditd?" && DO_AUDIT=true
+echo
+
+# ── 10 · Package cleanup ──────────────────────────────────────────────────────
+echo -e "${BOLD}── 10 · Remove Unnecessary Packages & Services ──────────${RESET}"
+DO_CLEANUP=false
+PKGS_TO_REMOVE=()
+SVCS_TO_DISABLE=()
+
+REMOVABLE_PKGS=(telnet rsh-client rsh-redone-client nis talk ntalk inetutils-telnetd xserver-xorg-core)
+REMOVABLE_SVCS=(bluetooth avahi-daemon cups isc-dhcp-server slapd nfs-server rpcbind rsync snmpd nis)
+
+ask "Review packages/services to remove?" && DO_CLEANUP=true
+
+if $DO_CLEANUP; then
+    echo
+    info "Which installed packages should be removed?"
+    for pkg in "${REMOVABLE_PKGS[@]}"; do
+        if dpkg -l "$pkg" &>/dev/null 2>&1; then
+            ask "  Remove package '${pkg}'?" && PKGS_TO_REMOVE+=("$pkg")
+        fi
+    done
+    echo
+    info "Which services should be disabled?"
+    for svc in "${REMOVABLE_SVCS[@]}"; do
+        if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "$svc"; then
+            ask "  Disable service '${svc}'?" && SVCS_TO_DISABLE+=("$svc")
+        fi
+    done
+fi
+echo
+
+# ── reboot ────────────────────────────────────────────────────────────────────
+DO_REBOOT=false
+ask "Reboot when finished?" && DO_REBOOT=true
+echo
+
+# ── confirm plan ──────────────────────────────────────────────────────────────
+echo -e "${BOLD}${CYAN}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║   Your Hardening Plan                           ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+
+yn() { $1 && echo -e "${GREEN}yes${RESET}" || echo -e "${YELLOW}no${RESET}"; }
+
+printf "  %-40s %s\n" "1 · System update"              "$(yn $DO_UPDATE)"
+if $DO_USER; then
+    printf "  %-40s %s\n" "2 · Create user"             "${GREEN}yes → ${NEW_USER}${RESET}"
+else
+    printf "  %-40s %s\n" "2 · Create user"             "$(yn $DO_USER)"
+fi
+if $DO_SSH && $SSH_CHANGE_PORT; then
+    printf "  %-40s %s\n" "3 · SSH hardening"           "${GREEN}yes → port ${SSH_PORT}${RESET}"
+else
+    printf "  %-40s %s\n" "3 · SSH hardening"           "$(yn $DO_SSH)"
+fi
+printf "  %-40s %s\n" "4 · UFW firewall"                "$(yn $DO_UFW)"
+printf "  %-40s %s\n" "5 · Fail2Ban"                    "$(yn $DO_FAIL2BAN)"
+printf "  %-40s %s\n" "6 · Automatic security updates"  "$(yn $DO_AUTOUPDATE)"
+printf "  %-40s %s\n" "7 · Kernel hardening"            "$(yn $DO_KERNEL)"
+printf "  %-40s %s\n" "8 · Secure shared memory"        "$(yn $DO_SHM)"
+printf "  %-40s %s\n" "9 · Audit logging"               "$(yn $DO_AUDIT)"
+if $DO_CLEANUP && [[ ${#PKGS_TO_REMOVE[@]} -gt 0 || ${#SVCS_TO_DISABLE[@]} -gt 0 ]]; then
+    printf "  %-40s %s\n" "10 · Package/service cleanup" \
+        "${GREEN}yes → pkgs: ${#PKGS_TO_REMOVE[@]}  svcs: ${#SVCS_TO_DISABLE[@]}${RESET}"
+else
+    printf "  %-40s %s\n" "10 · Package/service cleanup" "$(yn $DO_CLEANUP)"
+fi
+printf "  %-40s %s\n" "Reboot when done"                "$(yn $DO_REBOOT)"
+echo
+
+ask "Proceed with this plan?" || { echo "Aborted."; exit 0; }
+
+# =============================================================================
+#  PHASE 2 · EXECUTION – runs unattended
+# =============================================================================
+clear
+echo -e "${BOLD}${CYAN}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║   Ubuntu 24.04 LTS – Server Hardening           ║"
+echo "  ║   Phase 2: Executing                            ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+
+# ── 1 · System update ─────────────────────────────────────────────────────────
+section "1 · System Update"
+if $DO_UPDATE; then
     info "Updating package lists…"
     apt-get update -qq
-
-    info "Upgrading installed packages…"
+    info "Upgrading packages…"
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-
     info "Removing unused packages…"
     apt-get autoremove -y
-
-    ok "System is up to date."
+    ok "System up to date."
 else
     skip "System update"
 fi
 
-# =============================================================================
-# 2 · CREATE NON-ROOT SUDO USER
-# =============================================================================
+# ── 2 · Non-root user ─────────────────────────────────────────────────────────
 section "2 · Create Non-Root Sudo User"
-echo "  Creates a new user and adds it to the sudo group."
-echo "  Recommended to do BEFORE locking down SSH."
-echo
-
-if ask "Create a new non-root sudo user?"; then
-    while true; do
-        echo -en "${BOLD}[?]${RESET} Enter new username: "
-        read -r NEW_USER
-        [[ -n "$NEW_USER" ]] && break
-        echo "  Username cannot be empty."
-    done
-
+if $DO_USER; then
     if id "$NEW_USER" &>/dev/null; then
-        warn "User '${NEW_USER}' already exists. Ensuring sudo membership…"
+        warn "User '${NEW_USER}' already exists – ensuring sudo membership."
         usermod -aG sudo "$NEW_USER"
     else
         adduser --gecos "" "$NEW_USER"
         usermod -aG sudo "$NEW_USER"
-        ok "User '${NEW_USER}' created and added to sudo group."
+        ok "User '${NEW_USER}' created."
     fi
 
-    if ask "Copy root's authorized_keys to ${NEW_USER} (for key-based SSH)?"; then
+    if $COPY_KEYS; then
         ROOT_KEYS="/root/.ssh/authorized_keys"
         USER_SSH="/home/${NEW_USER}/.ssh"
         if [[ -f "$ROOT_KEYS" ]]; then
@@ -117,34 +365,19 @@ if ask "Create a new non-root sudo user?"; then
             ok "authorized_keys copied to ${NEW_USER}."
         else
             warn "No /root/.ssh/authorized_keys found – skipping key copy."
-            warn "Make sure you add an SSH key for '${NEW_USER}' before disabling password auth!"
         fi
     fi
 else
     skip "User creation"
 fi
 
-# =============================================================================
-# 3 · SSH HARDENING – DISABLE PASSWORD AUTH
-# =============================================================================
-section "3 · SSH Hardening – Disable Password Authentication"
-echo "  Sets: PermitRootLogin no"
-echo "        PasswordAuthentication no"
-echo "        MaxAuthTries 3"
-echo "        X11Forwarding no"
-echo "        ClientAliveInterval 300 / CountMax 2"
-echo
-
-warn "Ensure your SSH key is in authorized_keys BEFORE proceeding."
-warn "Otherwise you will lock yourself out!"
-echo
-
-if ask "Apply SSH hardening?"; then
+# ── 3 · SSH hardening ─────────────────────────────────────────────────────────
+section "3 · SSH Hardening"
+if $DO_SSH; then
     SSHD_CFG="/etc/ssh/sshd_config"
     cp "${SSHD_CFG}" "${SSHD_CFG}.bak.$(date +%Y%m%d%H%M%S)"
-    info "Backup saved: ${SSHD_CFG}.bak.*"
+    info "Backup saved."
 
-    # Helper: set or replace a directive
     set_sshd() {
         local key="$1" val="$2"
         if grep -qE "^#?[[:space:]]*${key}" "$SSHD_CFG"; then
@@ -154,100 +387,97 @@ if ask "Apply SSH hardening?"; then
         fi
     }
 
-    set_sshd PermitRootLogin        no
-    set_sshd PasswordAuthentication no
-    set_sshd PermitEmptyPasswords   no
-    set_sshd MaxAuthTries           3
-    set_sshd MaxSessions            3
-    set_sshd X11Forwarding          no
-    set_sshd IgnoreRhosts           yes
-    set_sshd HostbasedAuthentication no
-    set_sshd ClientAliveInterval    300
-    set_sshd ClientAliveCountMax    2
-    set_sshd UsePAM                 yes
+    # Write SSH keys BEFORE disabling password auth
+    if [[ ${#SSH_KEYS[@]} -gt 0 ]]; then
+        info "Writing ${#SSH_KEYS[@]} SSH key(s) to authorized_keys..."
 
-    # Optionally change SSH port
-    CURRENT_PORT=$(grep -E "^#?[[:space:]]*Port " "$SSHD_CFG" | tail -1 | awk '{print $2}' || echo 22)
-    CURRENT_PORT=${CURRENT_PORT:-22}
-    if ask "Change SSH port (currently ${CURRENT_PORT})? [Requires UFW update if enabled]"; then
-        while true; do
-            echo -en "${BOLD}[?]${RESET} Enter new SSH port (1024–65535): "
-            read -r SSH_PORT
-            if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1024 && SSH_PORT <= 65535 )); then
-                break
-            fi
-            echo "  Invalid port. Enter a number between 1024 and 65535."
+        # Write to root
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+        # Merge: keep existing keys, append new ones avoiding duplicates
+        touch /root/.ssh/authorized_keys
+        for key in "${SSH_KEYS[@]}"; do
+            grep -qxF "$key" /root/.ssh/authorized_keys || echo "$key" >> /root/.ssh/authorized_keys
         done
-        set_sshd Port "$SSH_PORT"
-        warn "SSH port set to ${SSH_PORT}. Remember to allow it in UFW!"
-        SSH_PORT_CHANGED=true
-    else
-        SSH_PORT=22
-        SSH_PORT_CHANGED=false
-    fi
+        chmod 600 /root/.ssh/authorized_keys
+        ok "Keys written to /root/.ssh/authorized_keys (${#SSH_KEYS[@]} key(s))."
 
-    # Optionally restrict to specific user
-    if [[ -n "${NEW_USER:-}" ]]; then
-        if ask "Restrict SSH logins to user '${NEW_USER}' only?"; then
-            set_sshd AllowUsers "$NEW_USER"
-            ok "AllowUsers set to ${NEW_USER}."
+        # Also write to new user if created
+        if [[ -n "${NEW_USER:-}" ]]; then
+            USER_SSH="/home/${NEW_USER}/.ssh"
+            mkdir -p "$USER_SSH"
+            touch "${USER_SSH}/authorized_keys"
+            for key in "${SSH_KEYS[@]}"; do
+                grep -qxF "$key" "${USER_SSH}/authorized_keys" || echo "$key" >> "${USER_SSH}/authorized_keys"
+            done
+            chown -R "${NEW_USER}:${NEW_USER}" "$USER_SSH"
+            chmod 700 "$USER_SSH"
+            chmod 600 "${USER_SSH}/authorized_keys"
+            ok "Keys written to ${USER_SSH}/authorized_keys."
         fi
+    else
+        warn "No SSH keys – skipping authorized_keys update."
     fi
 
-    sshd -t && systemctl restart sshd && ok "SSH daemon restarted with hardened config." \
-        || { err "sshd config test failed – reverting!"; cp "${SSHD_CFG}.bak."* "$SSHD_CFG"; systemctl restart sshd; }
+    set_sshd PermitRootLogin         no
+    set_sshd PasswordAuthentication  no
+    set_sshd PermitEmptyPasswords    no
+    set_sshd MaxAuthTries            3
+    set_sshd MaxSessions             3
+    set_sshd X11Forwarding           no
+    set_sshd IgnoreRhosts            yes
+    set_sshd HostbasedAuthentication no
+    set_sshd ClientAliveInterval     300
+    set_sshd ClientAliveCountMax     2
+    set_sshd UsePAM                  yes
+
+    $SSH_CHANGE_PORT  && set_sshd Port "$SSH_PORT"
+    $SSH_RESTRICT_USER && [[ -n "$NEW_USER" ]] && set_sshd AllowUsers "$NEW_USER"
+
+    SSH_SVC="ssh"
+    systemctl list-unit-files sshd.service &>/dev/null && SSH_SVC="sshd"
+    mkdir -p /run/sshd
+
+    if sshd -t; then
+        systemctl restart "$SSH_SVC"
+        ok "SSH daemon restarted with hardened config."
+    else
+        err "sshd config test failed – reverting!"
+        cp "$(ls -t "${SSHD_CFG}.bak."* | head -1)" "$SSHD_CFG"
+        systemctl restart "$SSH_SVC" || true
+    fi
 else
     skip "SSH hardening"
-    SSH_PORT=22
-    SSH_PORT_CHANGED=false
 fi
 
-# =============================================================================
-# 4 · UFW FIREWALL
-# =============================================================================
+# ── 4 · UFW ───────────────────────────────────────────────────────────────────
 section "4 · UFW Firewall"
-echo "  deny all incoming, allow all outgoing, allow SSH"
-echo
-
-if ask "Install and configure UFW?"; then
+if $DO_UFW; then
     apt-get install -y ufw -qq
-
     ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
 
-    SSH_PORT="${SSH_PORT:-22}"
     ufw allow "${SSH_PORT}/tcp" comment "SSH"
-    ok "Allowed SSH on port ${SSH_PORT}."
+    ok "SSH allowed on port ${SSH_PORT}."
 
-    if ask "Allow HTTP (port 80)?";  then ufw allow 80/tcp  comment "HTTP";  ok "HTTP allowed.";  fi
-    if ask "Allow HTTPS (port 443)?"; then ufw allow 443/tcp comment "HTTPS"; ok "HTTPS allowed."; fi
+    $UFW_HTTP  && ufw allow 80/tcp  comment "HTTP"  && ok "HTTP allowed."
+    $UFW_HTTPS && ufw allow 443/tcp comment "HTTPS" && ok "HTTPS allowed."
 
-    while ask "Allow another custom port?"; do
-        echo -en "${BOLD}[?]${RESET} Port number: "
-        read -r CUSTOM_PORT
-        echo -en "${BOLD}[?]${RESET} Protocol (tcp/udp) [tcp]: "
-        read -r CUSTOM_PROTO
-        CUSTOM_PROTO="${CUSTOM_PROTO:-tcp}"
-        ufw allow "${CUSTOM_PORT}/${CUSTOM_PROTO}"
-        ok "Allowed ${CUSTOM_PORT}/${CUSTOM_PROTO}."
+    for cp in "${UFW_CUSTOM_PORTS[@]}"; do
+        ufw allow "$cp"
+        ok "Allowed: ${cp}"
     done
 
     ufw --force enable
     ok "UFW enabled."
-    ufw status verbose
 else
     skip "UFW firewall"
 fi
 
-# =============================================================================
-# 5 · FAIL2BAN
-# =============================================================================
-section "5 · Fail2Ban – Brute-Force Protection"
-echo "  Installs Fail2Ban and enables the SSH jail."
-echo
-
-if ask "Install and configure Fail2Ban?"; then
+# ── 5 · Fail2Ban ──────────────────────────────────────────────────────────────
+section "5 · Fail2Ban"
+if $DO_FAIL2BAN; then
     apt-get install -y fail2ban -qq
 
     cat > /etc/fail2ban/jail.local << EOF
@@ -259,7 +489,7 @@ backend  = systemd
 
 [sshd]
 enabled  = true
-port     = ${SSH_PORT:-22}
+port     = ${SSH_PORT}
 logpath  = %(sshd_log)s
 maxretry = 3
 bantime  = 24h
@@ -267,19 +497,13 @@ EOF
 
     systemctl enable --now fail2ban
     ok "Fail2Ban installed and SSH jail active."
-    fail2ban-client status
 else
     skip "Fail2Ban"
 fi
 
-# =============================================================================
-# 6 · AUTOMATIC SECURITY UPDATES
-# =============================================================================
+# ── 6 · Automatic updates ─────────────────────────────────────────────────────
 section "6 · Automatic Security Updates"
-echo "  Installs unattended-upgrades for automatic security patches."
-echo
-
-if ask "Enable automatic security updates?"; then
+if $DO_AUTOUPDATE; then
     apt-get install -y unattended-upgrades apt-listchanges -qq
 
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
@@ -289,7 +513,6 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
 
-    # Ensure security updates are enabled in unattended-upgrades config
     sed -i 's|//\s*"${distro_id}:${distro_codename}-security";|"${distro_id}:${distro_codename}-security";|' \
         /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null || true
 
@@ -299,17 +522,11 @@ else
     skip "Automatic security updates"
 fi
 
-# =============================================================================
-# 7 · KERNEL HARDENING (sysctl)
-# =============================================================================
+# ── 7 · Kernel hardening ──────────────────────────────────────────────────────
 section "7 · Kernel Hardening"
-echo "  Writes hardened sysctl parameters to:"
-echo "  /etc/sysctl.d/99-hardening.conf"
-echo
-
-if ask "Apply kernel hardening via sysctl?"; then
+if $DO_KERNEL; then
     cat > /etc/sysctl.d/99-hardening.conf << 'EOF'
-# ── Network: IP spoofing / redirect protection ────────────────────────────────
+# Network: IP spoofing / redirect protection
 net.ipv4.conf.all.rp_filter                = 1
 net.ipv4.conf.default.rp_filter            = 1
 net.ipv4.conf.all.accept_redirects         = 0
@@ -322,35 +539,35 @@ net.ipv4.conf.all.accept_source_route      = 0
 net.ipv4.conf.default.accept_source_route  = 0
 net.ipv6.conf.all.accept_source_route      = 0
 
-# ── SYN flood protection ──────────────────────────────────────────────────────
+# SYN flood protection
 net.ipv4.tcp_syncookies                    = 1
 net.ipv4.tcp_max_syn_backlog               = 2048
 net.ipv4.tcp_synack_retries                = 2
 net.ipv4.tcp_syn_retries                   = 5
 
-# ── Ignore ICMP broadcasts / bogus errors ─────────────────────────────────────
+# Ignore ICMP broadcasts / bogus errors
 net.ipv4.icmp_echo_ignore_broadcasts       = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 
-# ── Log martians (spoofed packets) ───────────────────────────────────────────
+# Log martians (spoofed packets)
 net.ipv4.conf.all.log_martians             = 1
 net.ipv4.conf.default.log_martians         = 1
 
-# ── IPv6 router advertisements ───────────────────────────────────────────────
+# IPv6 router advertisements
 net.ipv6.conf.all.accept_ra                = 0
 net.ipv6.conf.default.accept_ra            = 0
 
-# ── Kernel address / pointer exposure ────────────────────────────────────────
+# Kernel address / pointer exposure
 kernel.kptr_restrict                       = 2
 kernel.dmesg_restrict                      = 1
 
-# ── Prevent ptrace abuse ─────────────────────────────────────────────────────
+# Prevent ptrace abuse
 kernel.yama.ptrace_scope                   = 1
 
-# ── Randomize memory layout (ASLR) ───────────────────────────────────────────
+# Randomize memory layout (ASLR)
 kernel.randomize_va_space                  = 2
 
-# ── Restrict core dumps ──────────────────────────────────────────────────────
+# Restrict core dumps
 fs.suid_dumpable                           = 0
 kernel.core_uses_pid                       = 1
 EOF
@@ -361,18 +578,12 @@ else
     skip "Kernel hardening"
 fi
 
-# =============================================================================
-# 8 · SECURE SHARED MEMORY
-# =============================================================================
-section "8 · Secure Shared Memory (/run/shm)"
-echo "  Mounts /run/shm with noexec, nosuid, nodev."
-echo "  Prevents code execution from shared memory."
-echo
-
-if ask "Secure shared memory?"; then
+# ── 8 · Secure shared memory ──────────────────────────────────────────────────
+section "8 · Secure Shared Memory"
+if $DO_SHM; then
     FSTAB="/etc/fstab"
     if grep -q "/run/shm" "$FSTAB"; then
-        warn "/run/shm already in fstab – skipping to avoid duplicate."
+        warn "/run/shm already in fstab – skipping."
     else
         cp "$FSTAB" "${FSTAB}.bak.$(date +%Y%m%d%H%M%S)"
         echo "tmpfs /run/shm tmpfs defaults,noexec,nosuid,nodev 0 0" >> "$FSTAB"
@@ -383,53 +594,31 @@ else
     skip "Secure shared memory"
 fi
 
-# =============================================================================
-# 9 · AUDIT LOGGING (auditd)
-# =============================================================================
-section "9 · Audit Logging (auditd)"
-echo "  Installs auditd for tracking security-relevant system calls."
-echo
-
-if ask "Install and enable auditd?"; then
+# ── 9 · Audit logging ─────────────────────────────────────────────────────────
+section "9 · Audit Logging"
+if $DO_AUDIT; then
     apt-get install -y auditd audispd-plugins -qq
 
-    # Basic audit rules
     cat > /etc/audit/rules.d/99-hardening.rules << 'EOF'
-# Delete existing rules
 -D
-
-# Set buffer size
 -b 8192
-
-# Failure mode: 1 = print, 2 = panic
 -f 1
 
-# Monitor authentication files
--w /etc/passwd       -p wa -k identity
--w /etc/shadow       -p wa -k identity
--w /etc/group        -p wa -k identity
--w /etc/gshadow      -p wa -k identity
--w /etc/sudoers      -p wa -k sudoers
--w /etc/sudoers.d/   -p wa -k sudoers
-
-# Monitor SSH config
+-w /etc/passwd          -p wa -k identity
+-w /etc/shadow          -p wa -k identity
+-w /etc/group           -p wa -k identity
+-w /etc/gshadow         -p wa -k identity
+-w /etc/sudoers         -p wa -k sudoers
+-w /etc/sudoers.d/      -p wa -k sudoers
 -w /etc/ssh/sshd_config -p wa -k sshd
+-w /var/log/lastlog     -p wa -k logins
+-w /var/run/faillock    -p wa -k logins
 
-# Monitor login/logout
--w /var/log/lastlog  -p wa -k logins
--w /var/run/faillock -p wa -k logins
-
-# Monitor privileged commands
 -a always,exit -F arch=b64 -S execve -F euid=0 -k root_commands
 -a always,exit -F arch=b32 -S execve -F euid=0 -k root_commands
-
-# Monitor network config changes
 -a always,exit -F arch=b64 -S sethostname -S setdomainname -k network_modification
--w /etc/hosts        -p wa -k hosts_file
--w /etc/network/     -p wa -k network
-
-# Make rules immutable (requires reboot to change)
-# -e 2
+-w /etc/hosts           -p wa -k hosts_file
+-w /etc/network/        -p wa -k network
 EOF
 
     systemctl enable --now auditd
@@ -439,94 +628,51 @@ else
     skip "Audit logging"
 fi
 
-# =============================================================================
-# 10 · REMOVE UNNECESSARY PACKAGES / SERVICES
-# =============================================================================
-section "10 · Remove Unnecessary Packages & Services"
-echo "  Removes/disables common packages not needed on a server."
-echo
-
-if ask "Review and remove unnecessary packages/services?"; then
-
-    REMOVABLE_PKGS=(
-        "telnet"
-        "rsh-client"
-        "rsh-redone-client"
-        "nis"
-        "talk"
-        "ntalk"
-        "inetutils-telnetd"
-        "xserver-xorg-core"
-    )
-
-    REMOVABLE_SVCS=(
-        "bluetooth"
-        "avahi-daemon"
-        "cups"
-        "isc-dhcp-server"
-        "slapd"
-        "nfs-server"
-        "rpcbind"
-        "rsync"
-        "snmpd"
-        "nis"
-    )
-
-    echo
-    info "Checking packages to remove…"
-    PKGS_TO_REMOVE=()
-    for pkg in "${REMOVABLE_PKGS[@]}"; do
-        if dpkg -l "$pkg" &>/dev/null 2>&1; then
-            if ask "  Remove package '${pkg}'?"; then
-                PKGS_TO_REMOVE+=("$pkg")
-            fi
-        fi
-    done
-
+# ── 10 · Package/service cleanup ──────────────────────────────────────────────
+section "10 · Package & Service Cleanup"
+if $DO_CLEANUP; then
     if [[ ${#PKGS_TO_REMOVE[@]} -gt 0 ]]; then
+        info "Removing packages: ${PKGS_TO_REMOVE[*]}"
         apt-get purge -y "${PKGS_TO_REMOVE[@]}" -qq
         apt-get autoremove -y -qq
-        ok "Removed: ${PKGS_TO_REMOVE[*]}"
+        ok "Packages removed."
     else
-        info "No packages removed."
+        info "No packages to remove."
     fi
 
-    echo
-    info "Checking services to disable…"
-    for svc in "${REMOVABLE_SVCS[@]}"; do
-        if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1 | grep -q "$svc"; then
-            if ask "  Disable and stop service '${svc}'?"; then
-                systemctl disable --now "$svc" 2>/dev/null && ok "Disabled: ${svc}" || warn "Could not disable ${svc} (may not be installed)."
-            fi
-        fi
-    done
+    if [[ ${#SVCS_TO_DISABLE[@]} -gt 0 ]]; then
+        for svc in "${SVCS_TO_DISABLE[@]}"; do
+            systemctl disable --now "$svc" 2>/dev/null \
+                && ok "Disabled: ${svc}" \
+                || warn "Could not disable ${svc}."
+        done
+    else
+        info "No services to disable."
+    fi
 else
     skip "Package/service cleanup"
 fi
 
 # =============================================================================
-# SUMMARY
+#  DONE
 # =============================================================================
 echo
 echo -e "${BOLD}${GREEN}"
-echo "  ╔═══════════════════════════════════════════╗"
-echo "  ║         Hardening Run Complete!           ║"
-echo "  ╚═══════════════════════════════════════════╝"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║         Hardening Complete!                     ║"
+echo "  ╚══════════════════════════════════════════════════╝"
 echo -e "${RESET}"
-
-echo -e "${BOLD}Next steps:${RESET}"
-echo "  • Verify SSH access in a NEW session before closing this one"
-echo "  • Run: sudo lynis audit system  (for a full security score)"
-echo "  • Run: sudo ufw status verbose  (review firewall rules)"
-echo "  • Run: sudo fail2ban-client status sshd  (check jail)"
-echo "  • Consider enabling Ubuntu Pro for USG/CIS automation:"
-echo "    sudo pro attach && sudo pro enable usg"
+echo -e "${BOLD}Verify:${RESET}"
+echo "  ssh -p ${SSH_PORT} ${NEW_USER:-ubuntu}@<ip>   ← test in a NEW session first"
+echo "  sudo ufw status verbose"
+echo "  sudo fail2ban-client status sshd"
+echo "  sudo lynis audit system"
 echo
 
-if ask "Reboot now to apply all changes (recommended)?"; then
+if $DO_REBOOT; then
     info "Rebooting in 5 seconds… (Ctrl+C to abort)"
     sleep 5
     reboot
 else
-    warn "Some changes (shared memory, kernel params) are fully active after reboot."
+    warn "Some changes (shared memory, kernel params) fully apply after reboot."
 fi
