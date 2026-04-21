@@ -441,6 +441,19 @@ if $DO_SSH; then
     $SSH_CHANGE_PORT  && set_sshd Port "$SSH_PORT"
     $SSH_RESTRICT_USER && [[ -n "$NEW_USER" ]] && set_sshd AllowUsers "$NEW_USER"
 
+    # Enforce perms — sshd refuses keys with loose modes, silent lockout
+    if [[ -d /root/.ssh ]]; then
+        chmod 700 /root/.ssh
+        [[ -f /root/.ssh/authorized_keys ]] && chmod 600 /root/.ssh/authorized_keys
+        chown -R root:root /root/.ssh
+    fi
+    if [[ -n "${NEW_USER:-}" && -d "/home/${NEW_USER}/.ssh" ]]; then
+        chmod 700 "/home/${NEW_USER}/.ssh"
+        [[ -f "/home/${NEW_USER}/.ssh/authorized_keys" ]] && chmod 600 "/home/${NEW_USER}/.ssh/authorized_keys"
+        chown -R "${NEW_USER}:${NEW_USER}" "/home/${NEW_USER}/.ssh"
+    fi
+    ok "authorized_keys perms locked (700 dir / 600 file)."
+
     SSH_SVC="ssh"
     systemctl list-unit-files sshd.service &>/dev/null && SSH_SVC="sshd"
     mkdir -p /run/sshd
