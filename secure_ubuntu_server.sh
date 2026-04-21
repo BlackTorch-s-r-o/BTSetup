@@ -375,6 +375,13 @@ fi
 section "3 · SSH Hardening"
 if $DO_SSH; then
     SSHD_CFG="/etc/ssh/sshd_config"
+    if [[ ! -f "$SSHD_CFG" ]]; then
+        warn "openssh-server not installed – installing now."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server -qq
+    fi
+    if [[ ! -f "$SSHD_CFG" ]]; then
+        err "${SSHD_CFG} still missing after install – aborting SSH hardening."
+    fi
     cp "${SSHD_CFG}" "${SSHD_CFG}.bak.$(date +%Y%m%d%H%M%S)"
     info "Backup saved."
 
