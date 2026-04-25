@@ -31,6 +31,16 @@ echo "  Git & GitHub SSH Setup Script"
 echo "================================================"
 echo ""
 
+# Fix .ssh ownership and permissions (in case files were created as root)
+log_step "Fixing .ssh directory ownership and permissions..."
+CURRENT_USER=$(whoami)
+sudo chown -R "${CURRENT_USER}:${CURRENT_USER}" "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+find "$HOME/.ssh" -type f -name "*.pub" -exec chmod 644 {} \;
+find "$HOME/.ssh" -type f ! -name "*.pub" -exec chmod 600 {} \;
+log_info "Ownership and permissions fixed for $HOME/.ssh"
+echo ""
+
 # Install Git
 log_step "Installing Git..."
 sudo apt update
@@ -67,7 +77,7 @@ if [ -f "$SSH_KEY_PATH" ]; then
     log_warn "SSH key already exists at $SSH_KEY_PATH"
     echo "Do you want to use the existing key? (y/n)"
     read -r USE_EXISTING < /dev/tty
-    
+
     if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
         echo "Enter a name for the new key (default: id_ed25519_github):"
         read -r KEY_NAME < /dev/tty
@@ -80,6 +90,9 @@ if [ ! -f "$SSH_KEY_PATH" ]; then
     log_info "Creating new SSH key..."
     ssh-keygen -t ed25519 -C "$GIT_EMAIL" -f "$SSH_KEY_PATH" -N ""
     log_info "SSH key generated at: $SSH_KEY_PATH"
+    # Fix permissions on the newly created key
+    chmod 600 "$SSH_KEY_PATH"
+    chmod 644 "${SSH_KEY_PATH}.pub"
 else
     log_info "Using existing SSH key at: $SSH_KEY_PATH"
 fi
@@ -112,7 +125,7 @@ while true; do
     read -r < /dev/tty
 
     log_info "Testing GitHub SSH connection..."
-    
+
     if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
         log_info "GitHub SSH connection successful!"
         echo ""
@@ -130,7 +143,7 @@ while true; do
         echo "  2. Display the public key again"
         echo "  3. Exit"
         read -r CHOICE < /dev/tty
-        
+
         case $CHOICE in
             1)
                 continue
@@ -151,27 +164,34 @@ while true; do
     fi
 done
 
-# Optional: Configure SSH config for GitHub
+# Configure SSH config for GitHub
 log_step "Configuring SSH for GitHub..."
 SSH_CONFIG="$HOME/.ssh/config"
 
-if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
-    log_info "Adding GitHub to SSH config..."
-    mkdir -p "$HOME/.ssh"
-    cat >> "$SSH_CONFIG" << EOF
+if grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
+    log_warn "GitHub entry already exists in SSH config — removing old entry..."
+    # Remove existing github.com block (handles both HostName variants)
+    awk '
+        /^Host github\.com/ { skip=1; next }
+        skip && /^Host / { skip=0 }
+        !skip { print }
+    ' "$SSH_CONFIG" > "${SSH_CONFIG}.tmp" && mv "${SSH_CONFIG}.tmp" "$SSH_CONFIG"
+fi
+
+log_info "Appending GitHub config (port 443 via ssh.github.com)..."
+cat >> "$SSH_CONFIG" << EOF
 
 # GitHub configuration
 Host github.com
-    HostName github.com
+    HostName ssh.github.com
+    Port 443
     User git
     IdentityFile $SSH_KEY_PATH
     IdentitiesOnly yes
 EOF
-    chmod 600 "$SSH_CONFIG"
-    log_info "SSH config updated"
-else
-    log_info "GitHub already configured in SSH config"
-fi
+
+chmod 600 "$SSH_CONFIG"
+log_info "SSH config updated"
 
 echo ""
 log_info "Setup complete!"

@@ -214,19 +214,28 @@ fi
 # =============================================================================
 section "5 · Ubuntu 24.04 Image"
 
-# Official Ubuntu 24.04.4 LTS ARM64 Raspberry Pi image
-IMAGE_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-preinstalled-server-arm64+raspi.img.xz"
 IMAGE_FILENAME="ubuntu-24.04.4-preinstalled-server-arm64+raspi.img.xz"
 IMAGE_CACHE_DIR="/var/cache/rpi-nvme-install"
-mkdir -p "$IMAGE_CACHE_DIR"
 IMAGE_PATH="${IMAGE_CACHE_DIR}/${IMAGE_FILENAME}"
 IMAGE_EXTRACTED="${IMAGE_CACHE_DIR}/ubuntu-24.04.4-preinstalled-server-arm64+raspi.img"
+SHA256_EXPECTED="790652faeb4f61ce7bb12f5cb61734595c61d3cd882915b8b5f9918106c80d37"
+
+# Mirrors tried in order (EU first, canonical fallback)
+IMAGE_URLS=(
+    "https://ftp.cvut.cz/ubuntu-releases/noble/${IMAGE_FILENAME}"
+    "https://mirrors.nic.cz/ubuntu-releases/noble/${IMAGE_FILENAME}"
+    "https://cdimage.ubuntu.com/releases/noble/release/${IMAGE_FILENAME}"
+)
+
+mkdir -p "$IMAGE_CACHE_DIR"
 
 echo "  Source: Ubuntu 24.04.4 LTS – preinstalled server – ARM64 (Raspberry Pi)"
-echo "  URL:    ${IMAGE_URL}"
 echo
 
-# Check for existing image
+# ── Decide whether to download ────────────────────────────────────────────────
+SKIP_DOWNLOAD=false
+ALREADY_DOWNLOADED=false
+
 if [[ -f "$IMAGE_EXTRACTED" ]]; then
     IMG_SIZE=$(du -h "$IMAGE_EXTRACTED" | cut -f1)
     info "Found existing extracted image: ${IMAGE_EXTRACTED} (${IMG_SIZE})"
@@ -234,48 +243,51 @@ if [[ -f "$IMAGE_EXTRACTED" ]]; then
         SKIP_DOWNLOAD=true
     else
         rm -f "$IMAGE_EXTRACTED" "$IMAGE_PATH"
-        SKIP_DOWNLOAD=false
     fi
 elif [[ -f "$IMAGE_PATH" ]]; then
     info "Found existing compressed image: ${IMAGE_PATH}"
     if ask "Use and extract existing download? (No = re-download)"; then
-        SKIP_DOWNLOAD=false
         ALREADY_DOWNLOADED=true
     else
         rm -f "$IMAGE_PATH"
-        SKIP_DOWNLOAD=false
-        ALREADY_DOWNLOADED=false
     fi
-else
-    SKIP_DOWNLOAD=false
-    ALREADY_DOWNLOADED=false
 fi
 
-if [[ "${SKIP_DOWNLOAD:-false}" == false ]]; then
-    if [[ "${ALREADY_DOWNLOADED:-false}" == false ]]; then
-        info "Downloading Ubuntu 24.04.4 LTS image (~1.2 GB)…"
-        wget --show-progress -O "$IMAGE_PATH" "$IMAGE_URL" \
-            || err "Download failed. Check internet connection and try again."
-        ok "Download complete."
+# ── Download ──────────────────────────────────────────────────────────────────
+if [[ "$SKIP_DOWNLOAD" == false && "$ALREADY_DOWNLOADED" == false ]]; then
+    DOWNLOAD_OK=false
+    for URL in "${IMAGE_URLS[@]}"; do
+        info "Trying: ${URL}"
+        if wget -4 --show-progress --timeout=30 --tries=2 -O "$IMAGE_PATH" "$URL"; then
+            ok "Download complete."
+            DOWNLOAD_OK=true
+            break
+        else
+            warn "Failed. Trying next mirror…"
+            rm -f "$IMAGE_PATH"
+        fi
+    done
+    [[ "$DOWNLOAD_OK" == true ]] || err "All mirrors failed. Check internet connection and try again."
+fi
 
-    # Verify SHA256 checksum
-    info "Verifying SHA256 checksum..."
-    SHA256_EXPECTED="790652faeb4f61ce7bb12f5cb61734595c61d3cd882915b8b5f9918106c80d37"
+# ── Verify checksum ───────────────────────────────────────────────────────────
+if [[ "$SKIP_DOWNLOAD" == false ]]; then
+    info "Verifying SHA256 checksum…"
     ACTUAL=$(sha256sum "$IMAGE_PATH" | awk '{print $1}')
     if [[ "$ACTUAL" == "$SHA256_EXPECTED" ]]; then
         ok "Checksum verified."
     else
         err "Checksum mismatch! Image may be corrupt. Delete ${IMAGE_PATH} and retry."
     fi
-    fi
 
+    # ── Extract ───────────────────────────────────────────────────────────────
     info "Extracting image (this takes a few minutes)…"
-    xz --decompress --keep --threads=0 "$IMAGE_PATH"
-    # xz writes to same dir without .xz extension
+    xz --decompress --threads=0 "$IMAGE_PATH"   # consumes .xz, writes .img in place
     mv "${IMAGE_PATH%.xz}" "$IMAGE_EXTRACTED" 2>/dev/null || true
     ok "Image extracted: ${IMAGE_EXTRACTED}"
 fi
 
+# ── Size check ────────────────────────────────────────────────────────────────
 IMG_SIZE_BYTES=$(stat -c%s "$IMAGE_EXTRACTED")
 IMG_SIZE_GB=$(echo "scale=1; ${IMG_SIZE_BYTES}/1024/1024/1024" | bc)
 info "Image size: ${IMG_SIZE_GB} GB"
@@ -283,7 +295,6 @@ info "Image size: ${IMG_SIZE_GB} GB"
 if (( IMG_SIZE_BYTES > NVME_SIZE_BYTES )); then
     err "Image (${IMG_SIZE_GB} GB) is larger than NVMe (${NVME_SIZE_GB} GB). Cannot continue."
 fi
-
 # =============================================================================
 # 6 · FLASH IMAGE TO NVME
 # =============================================================================
