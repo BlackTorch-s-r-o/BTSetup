@@ -26,6 +26,12 @@ log_step() {
     echo -e "${BLUE}[STEP]${NC} $1"
 }
 
+if [ "$EUID" -eq 0 ]; then
+    log_error "Don't run this with sudo — it installs the SSH key for root."
+    log_error "Run as your normal user; the script will sudo only for apt."
+    exit 1
+fi
+
 echo "================================================"
 echo "  Git & GitHub SSH Setup Script"
 echo "================================================"
