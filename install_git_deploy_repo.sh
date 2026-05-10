@@ -55,24 +55,26 @@ log_info "Git installed successfully"
 echo ""
 
 # Configure Git user
-log_step "Configuring Git user information..."
-echo "Enter your Git username (e.g., 'Ondra' or 'Your Name'):"
+log_step "Configuring Git user information (leave blank to skip)..."
+echo "Enter your Git username (e.g., 'Ondra' or 'Your Name') [skip]:"
 read -r GIT_USERNAME < /dev/tty
 
-echo "Enter your Git email (e.g., 'your.email@example.com'):"
+echo "Enter your Git email (e.g., 'your.email@example.com') [skip]:"
 read -r GIT_EMAIL < /dev/tty
 
-if [ -z "$GIT_USERNAME" ] || [ -z "$GIT_EMAIL" ]; then
-    log_error "Username and email cannot be empty"
-    exit 1
+if [ -n "$GIT_USERNAME" ]; then
+    git config --global user.name "$GIT_USERNAME"
+    log_info "Git username set: $GIT_USERNAME"
+else
+    log_warn "Skipped git user.name"
 fi
 
-git config --global user.name "$GIT_USERNAME"
-git config --global user.email "$GIT_EMAIL"
-
-log_info "Git configured with:"
-echo "  Username: $GIT_USERNAME"
-echo "  Email: $GIT_EMAIL"
+if [ -n "$GIT_EMAIL" ]; then
+    git config --global user.email "$GIT_EMAIL"
+    log_info "Git email set: $GIT_EMAIL"
+else
+    log_warn "Skipped git user.email"
+fi
 echo ""
 
 # Generate SSH key
@@ -94,7 +96,8 @@ fi
 
 if [ ! -f "$SSH_KEY_PATH" ]; then
     log_info "Creating new SSH key..."
-    ssh-keygen -t ed25519 -C "$GIT_EMAIL" -f "$SSH_KEY_PATH" -N ""
+    SSH_KEY_COMMENT="${GIT_EMAIL:-${CURRENT_USER}@$(hostname)}"
+    ssh-keygen -t ed25519 -C "$SSH_KEY_COMMENT" -f "$SSH_KEY_PATH" -N ""
     log_info "SSH key generated at: $SSH_KEY_PATH"
     # Fix permissions on the newly created key
     chmod 600 "$SSH_KEY_PATH"
