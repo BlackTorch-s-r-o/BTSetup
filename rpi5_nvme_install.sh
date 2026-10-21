@@ -1,669 +1,673 @@
 #!/usr/bin/env bash
 # =============================================================================
-# BlackTorch – Ubuntu 24.04 server hardening  (v2)
-#
-# All questions asked upfront, then runs unattended (except `adduser` if you
-# ask it to create a brand-new user).  Run:  sudo bash secure_ubuntu_server.sh
-#
-# Changes vs v1:
-#   * SSH keys go to the ADMIN USER, never to root (v1 could lock you out when
-#     no user was created, because root login is disabled).
-#   * Hardening is a drop-in (00-bt-hardening.conf) that sorts before
-#     50-cloud-init.conf, so it actually wins (sshd = first match wins), and the
-#     EFFECTIVE config is verified with `sshd -T`.
-#   * No SSH port change (Ubuntu 24.04 ssh.socket + UFW = lockout trap).
-#   * Refuses to disable password auth unless the admin user has >=1 valid key.
-#   * Optional auto-revert timer: SSH/UFW changes roll back after N minutes
-#     unless you cancel it from a second, working SSH session.
-#   * UFW: no `reset`, optional SSH source restriction, WireGuard port, and
-#     Incus bridge rules (UFW's default forward policy breaks Incus NAT/DHCP).
-#   * Kernel: rp_filter=2 (loose), no accept_ra=0, no log_martians.
-#   * Dropped the /run/shm fstab hack (/run/shm is a symlink on Ubuntu).
-#   * auditd: no execve-for-root logging (fills the disk); rules fit this stack.
+# RPi 5 – Ubuntu 24.04 NVMe Boot Installer
+# Run this FROM the SD card (current Ubuntu 24.04 session).
+# After completion, remove SD card and reboot into NVMe.
 # =============================================================================
-set -Eeuo pipefail
 
-VERSION="2.0"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="/var/log/bt-harden.log"
-BACKUP_DIR="/root/bt-harden-backup-${STAMP}"
-SSH_DROPIN="/etc/ssh/sshd_config.d/00-bt-hardening.conf"
-REVERT_SCRIPT="/usr/local/sbin/bt-harden-revert.sh"
-REVERT_UNIT="bt-harden-revert"
+set -euo pipefail
 
-# ── colours / helpers ─────────────────────────────────────────────────────────
-RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
-CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+# ── colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
 
-info()    { printf '%s[INFO]%s %s\n'  "$CYAN"   "$RESET" "$*"; }
-ok()      { printf '%s[OK]%s %s\n'    "$GREEN"  "$RESET" "$*"; }
-warn()    { printf '%s[WARN]%s %s\n'  "$YELLOW" "$RESET" "$*"; }
-skip()    { printf '%s[SKIP]%s %s\n'  "$YELLOW" "$RESET" "$*"; }
-err()     { printf '%s[ERROR]%s %s\n' "$RED"    "$RESET" "$*" >&2; exit 1; }
-section() { printf '\n%s%s══ %s ══%s\n' "$BOLD" "$CYAN" "$*" "$RESET"; }
-err_trap() { printf '%s[ERROR]%s failed at line %s (log: %s)\n' "$RED" "$RESET" "$1" "$LOG" >&2; }
+info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+err()     { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
+section() {
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  $*${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+}
 
-# ask "question" [y|n]   -> returns 0 for yes. Default is n unless given.
 ask() {
-    local prompt="$1" def="${2:-n}" hint answer
-    [[ "$def" == "y" ]] && hint="[Y/n]" || hint="[y/N]"
+    local prompt="$1"
     while true; do
-        printf '%s%s[?]%s %s %s%s%s ' "$BOLD" "$YELLOW" "$RESET" "$prompt" "$BOLD" "$hint" "$RESET" >&2
-        read -r answer || answer=""
+        echo -en "${BOLD}${YELLOW}[?]${RESET} ${prompt} ${BOLD}[y/N]${RESET} "
+        read -r answer
         case "${answer,,}" in
             y|yes) return 0 ;;
-            n|no)  return 1 ;;
-            "")    [[ "$def" == "y" ]] && return 0 || return 1 ;;
-            *)     echo " Please answer y or n." >&2 ;;
+            n|no|"") return 1 ;;
+            *) echo "  Please answer y or n." ;;
         esac
     done
 }
 
-# prompt "text" VARNAME  -> reads a line into VARNAME (empty allowed)
-prompt() {
-    local text="$1" var="$2" val
-    printf '%s[?]%s %s ' "$BOLD" "$RESET" "$text" >&2
-    read -r val || val=""
-    printf -v "$var" '%s' "$val"
+pause() {
+    echo -en "${BOLD}${YELLOW}[>]${RESET} Press ENTER to continue…"
+    read -r
 }
 
-# ── validators ────────────────────────────────────────────────────────────────
-# valid_key "ssh-ed25519 AAAA... comment"  (checked by ssh-keygen itself)
-valid_key() {
-    local k="$1" tmp rc=0
-    local re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+'
-    [[ "$k" =~ $re ]] || return 1
-    tmp="$(mktemp)"
-    printf '%s\n' "$k" > "$tmp"
-    ssh-keygen -l -f "$tmp" >/dev/null 2>&1 || rc=1
-    rm -f "$tmp"
-    return "$rc"
-}
+# ── root check ────────────────────────────────────────────────────────────────
+[[ $EUID -ne 0 ]] && err "Run this script as root: sudo ./rpi5-nvme-install.sh"
 
-key_desc() {   # "256 SHA256:xxx comment (ED25519)"
-    local tmp; tmp="$(mktemp)"
-    printf '%s\n' "$1" > "$tmp"
-    ssh-keygen -l -f "$tmp" 2>/dev/null || echo "?"
-    rm -f "$tmp"
-}
-
-count_keys_in_file() {   # number of keys ssh-keygen can read from an authorized_keys file
-    local f="$1"
-    [[ -f "$f" ]] || { echo 0; return 0; }
-    { ssh-keygen -l -f "$f" 2>/dev/null || true; } | wc -l
-}
-
-# ip_in_cidr IP CIDR -> 0 inside, 1 outside, 2 invalid input
-ip_in_cidr() {
-    python3 -I - "$1" "$2" <<'PY'
-import ipaddress, sys
-try:
-    sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_network(sys.argv[2], strict=False) else 1)
-except ValueError:
-    sys.exit(2)
-PY
-}
-
-valid_cidr() {   # accepts a single IP or a CIDR
-    local rc=0
-    ip_in_cidr "0.0.0.0" "$1" || rc=$?
-    [[ $rc -ne 2 ]]
-}
-
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
-
-current_client_ip() {
-    local ip="${SSH_CLIENT:-}"; ip="${ip%% *}"
-    [[ -z "$ip" ]] && ip="$(who -m 2>/dev/null | sed -n 's/.*(\(.*\))$/\1/p')"
-    echo "$ip"
-}
-
-detect_ssh_svc() {
-    local s
-    for s in ssh sshd; do
-        if systemctl list-unit-files "${s}.service" 2>/dev/null | grep -q "^${s}.service"; then
-            echo "$s"; return 0
-        fi
-    done
-    echo ssh
-}
-
-detect_ssh_ports() {
-    local p
-    p="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -un | tr '\n' ' ')" || true
-    echo "${p:-22}"
-}
-
-# ── config renderers (kept separate so they can be tested) ────────────────────
-render_sshd_dropin() {
-    cat <<EOF
-# Managed by BTSetup secure_ubuntu_server.sh v${VERSION} on ${STAMP}
-# Sorts before 50-cloud-init.conf on purpose: for sshd the FIRST value wins.
-PermitRootLogin no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-PermitEmptyPasswords no
-HostbasedAuthentication no
-IgnoreRhosts yes
-MaxAuthTries 3
-LoginGraceTime 30
-MaxSessions 4
-X11Forwarding no
-ClientAliveInterval 300
-ClientAliveCountMax 2
-EOF
-    if "${SSH_RESTRICT_USER:-false}"; then echo "AllowUsers ${TARGET_USER}"; fi
-}
-
-render_fail2ban() {
-    cat <<EOF
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-backend  = systemd
-ignoreip = 127.0.0.1/8 ::1${F2B_IGNORE:+ ${F2B_IGNORE}}
-
-[sshd]
-enabled  = true
-maxretry = 3
-bantime  = 24h
-EOF
-}
-
-render_sysctl() {
-    cat <<'EOF'
-# BTSetup kernel hardening. Deliberately does NOT touch ip_forward (Incus/WireGuard
-# manage it), accept_ra (colo IPv6 may rely on RA) or log_martians (noisy on a bridge).
-
-# Spoofing / redirects / source routing. rp_filter=2 (loose) is safe with
-# WireGuard, bridges and asymmetric paths; strict (1) can silently drop traffic.
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
-
-# SYN flood / ICMP noise
-net.ipv4.tcp_syncookies = 1
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-
-# Info leaks
-kernel.kptr_restrict = 2
-kernel.dmesg_restrict = 1
-kernel.yama.ptrace_scope = 1
-kernel.randomize_va_space = 2
-fs.suid_dumpable = 0
-fs.protected_hardlinks = 1
-fs.protected_symlinks = 1
-EOF
-}
-
-render_audit_rules() {
-    cat <<'EOF'
--D
--b 8192
--f 1
--w /etc/passwd -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/group -p wa -k identity
--w /etc/gshadow -p wa -k identity
--w /etc/sudoers -p wa -k sudoers
--w /etc/sudoers.d/ -p wa -k sudoers
--w /etc/ssh/sshd_config -p wa -k sshd
--w /etc/ssh/sshd_config.d/ -p wa -k sshd
--w /root/.ssh/ -p wa -k ssh_keys
--w /etc/netplan/ -p wa -k network
--w /etc/wireguard/ -p wa -k wireguard
--w /etc/fstab -p wa -k mounts
--a always,exit -F arch=b64 -S sethostname -S setdomainname -k network_modification
-EOF
-}
-
-render_revert_script() {
-    cat <<EOF
-#!/usr/bin/env bash
-# Written by BTSetup hardening. Fires if you did not cancel the timer.
-rm -f "${SSH_DROPIN}"
-systemctl reload ${SSH_SVC} 2>/dev/null || systemctl restart ${SSH_SVC} || true
-command -v ufw >/dev/null 2>&1 && ufw --force disable || true
-logger -t bt-harden "auto-revert fired: SSH drop-in removed, UFW disabled"
-EOF
-}
-
-# ── globals set during planning ───────────────────────────────────────────────
-DO_UPDATE=false; DO_SSH=false; DO_UFW=false; DO_FAIL2BAN=false
-DO_AUTOUPDATE=false; DO_KERNEL=false; DO_AUDIT=false; DO_CLEANUP=false
-DO_REBOOT=false; DO_REVERT=false; REVERT_MIN=10
-TARGET_USER=""; CREATE_USER=false; SSH_RESTRICT_USER=false
-SSH_KEYS=(); SSH_ALLOW_CIDR=""
-UFW_HTTP=false; UFW_HTTPS=false; UFW_INCUS=false; UFW_PORTS=()
-F2B_IGNORE=""
-PKGS_TO_REMOVE=(); SVCS_TO_DISABLE=()
-SSH_SVC="ssh"
+# ── RPi 5 check ───────────────────────────────────────────────────────────────
+MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "unknown")
+if ! echo "$MODEL" | grep -qi "Raspberry Pi 5"; then
+    warn "This script is designed for Raspberry Pi 5."
+    warn "Detected: ${MODEL}"
+    ask "Continue anyway?" || exit 1
+fi
 
 # =============================================================================
-# PHASE 1 · PLANNING
-# =============================================================================
-plan() {
-    [[ $EUID -eq 0 ]] || err "Run as root: sudo bash $0"
-    command -v ssh-keygen >/dev/null || err "ssh-keygen missing (apt install openssh-client)"
-    command -v python3 >/dev/null || err "python3 missing"
-    if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == 24.* ]] || \
-            warn "Written for Ubuntu 24.04, this is ${PRETTY_NAME:-unknown}."
-    fi
-
-    printf '%s%s\n  BlackTorch · Ubuntu server hardening v%s · Phase 1: planning\n%s\n' "$BOLD" "$CYAN" "$VERSION" "$RESET"
-    warn "Keep this SSH session open AND have the iDRAC virtual console ready."
-    echo
-
-    # 1 · update
-    section "1 · System update"
-    ask "Run apt update + full-upgrade + autoremove?" y && DO_UPDATE=true
-
-    # 2/3 · admin user + SSH
-    section "2 · Admin user & SSH hardening"
-    echo " Disables root login and password auth (drop-in file, verified with sshd -T)."
-    if ask "Apply SSH hardening?" y; then
-        DO_SSH=true
-        local def="${SUDO_USER:-}"
-        while true; do
-            prompt "Admin username that will log in via SSH [${def:-none}]:" TARGET_USER
-            TARGET_USER="${TARGET_USER:-$def}"
-            [[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && break
-            echo " Invalid username." >&2
-        done
-        if id "$TARGET_USER" &>/dev/null; then
-            info "User '${TARGET_USER}' exists."
-        else
-            CREATE_USER=true
-            info "User '${TARGET_USER}' will be created (adduser asks for a password in phase 2)."
-        fi
-
-        local ak="" existing=0
-        if ! $CREATE_USER; then
-            ak="$(getent passwd "$TARGET_USER" | cut -d: -f6)/.ssh/authorized_keys"
-            existing="$(count_keys_in_file "$ak")"
-            info "${TARGET_USER} already has ${existing} valid key(s) in authorized_keys."
-        fi
-
-        # GitHub import
-        local gh k
-        prompt "Import keys from GitHub username (blank = skip):" gh
-        if [[ -n "$gh" ]]; then
-            if [[ "$gh" =~ ^[A-Za-z0-9-]+$ ]] && command -v curl >/dev/null; then
-                local fetched; fetched="$(curl -fsSL --max-time 10 "https://github.com/${gh}.keys" 2>/dev/null || true)"
-                while IFS= read -r k; do
-                    [[ -z "$k" ]] && continue
-                    if valid_key "$k"; then SSH_KEYS+=("$k"); info "GitHub key: $(key_desc "$k")"; fi
-                done <<< "$fetched"
-            else
-                warn "Bad GitHub username or curl missing – skipped."
-            fi
-        fi
-
-        # paste
-        echo " Paste public keys (cat ~/.ssh/id_ed25519.pub), blank line to finish:"
-        while true; do
-            prompt "[key]" k
-            [[ -z "$k" ]] && break
-            if valid_key "$k"; then
-                SSH_KEYS+=("$k"); ok "Accepted: $(key_desc "$k")"
-            else
-                warn "Not a valid public key – ignored."
-            fi
-        done
-
-        if (( existing + ${#SSH_KEYS[@]} == 0 )); then
-            warn "No keys available for ${TARGET_USER}. Password auth would be disabled with NO way in."
-            warn "SSH hardening DISABLED for this run. Add a key and re-run."
-            DO_SSH=false
-        else
-            ask "Restrict SSH logins to '${TARGET_USER}' only (AllowUsers)?" && SSH_RESTRICT_USER=true
-        fi
-    fi
-
-    # 4 · UFW
-    section "3 · UFW firewall"
-    echo " deny incoming, allow outgoing, allow SSH (existing rules are kept, no reset)."
-    if ask "Install and configure UFW?" y; then
-        DO_UFW=true
-        local cidr client
-        prompt "Allow SSH only from this IP/CIDR (blank = anywhere):" cidr
-        if [[ -n "$cidr" ]]; then
-            if valid_cidr "$cidr"; then
-                client="$(current_client_ip)"
-                if [[ -n "$client" ]] && ! ip_in_cidr "$client" "$cidr"; then
-                    warn "Your current SSH client (${client}) is NOT inside ${cidr} – you would lock yourself out."
-                    warn "Ignoring the restriction; SSH stays open to anywhere."
-                else
-                    SSH_ALLOW_CIDR="$cidr"
-                fi
-            else
-                warn "Not a valid IP/CIDR – ignored."
-            fi
-        fi
-        ask "Allow HTTP (80)?"  && UFW_HTTP=true
-        ask "Allow HTTPS (443)?" && UFW_HTTPS=true
-        local wg
-        prompt "WireGuard UDP port to allow (e.g. 51820, blank = none):" wg
-        if [[ -n "$wg" ]]; then
-            valid_port "$wg" && UFW_PORTS+=("${wg}/udp") || warn "Invalid port – ignored."
-        fi
-        ask "Will this host run Incus (adds incusbr0 rules so VM NAT/DHCP/DNS work)?" y && UFW_INCUS=true
-        local cp proto
-        while ask "Allow another custom port?"; do
-            prompt "Port number:" cp
-            prompt "Protocol (tcp/udp) [tcp]:" proto
-            proto="${proto:-tcp}"
-            if valid_port "$cp" && [[ "$proto" =~ ^(tcp|udp)$ ]]; then UFW_PORTS+=("${cp}/${proto}"); else warn "Invalid – ignored."; fi
-        done
-    fi
-
-    # 5 · fail2ban
-    section "4 · Fail2Ban"
-    if ask "Install and configure Fail2Ban (sshd jail)?" y; then
-        DO_FAIL2BAN=true
-        local ig item
-        prompt "Trusted IPs/CIDRs that must never be banned (space-separated, blank = none):" ig
-        for item in $ig; do
-            valid_cidr "$item" && F2B_IGNORE+="${F2B_IGNORE:+ }${item}" || warn "Skipping invalid '${item}'."
-        done
-    fi
-
-    # 6-9
-    section "5 · Misc"
-    ask "Enable automatic SECURITY updates (no auto-reboot)?" y && DO_AUTOUPDATE=true
-    ask "Apply kernel/network sysctl hardening?" y && DO_KERNEL=true
-    ask "Install auditd with a small rule set (identity, sudo, ssh, netplan, wireguard)?" && DO_AUDIT=true
-
-    if ask "Review packages/services to remove/disable?"; then
-        DO_CLEANUP=true
-        local pkg svc
-        for pkg in telnet rsh-client rsh-redone-client nis talk ntalk inetutils-telnetd; do
-            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-                ask " Remove package '${pkg}'?" && PKGS_TO_REMOVE+=("$pkg")
-            fi
-        done
-        for svc in bluetooth avahi-daemon cups cups-browsed rpcbind snmpd; do
-            if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-                ask " Disable service '${svc}'?" && SVCS_TO_DISABLE+=("$svc")
-            fi
-        done
-    fi
-
-    # safety net + reboot
-    if $DO_SSH || $DO_UFW; then
-        section "6 · Safety net"
-        echo " Auto-revert removes the SSH drop-in and disables UFW after N minutes unless"
-        echo " you cancel it from a NEW working SSH session:  systemctl stop ${REVERT_UNIT}.timer"
-        if ask "Arm the auto-revert timer?" y; then
-            DO_REVERT=true
-            local m; prompt "Minutes [10]:" m
-            [[ "$m" =~ ^[0-9]+$ ]] && (( m >= 2 && m <= 120 )) && REVERT_MIN="$m"
-        fi
-    fi
-    if $DO_REVERT; then
-        info "Auto-reboot disabled while the revert timer is armed (a reboot would drop the timer)."
-    else
-        ask "Reboot when finished?" && DO_REBOOT=true
-    fi
-
-    # summary
-    yn() { if "$1"; then printf '%syes%s' "$GREEN" "$RESET"; else printf '%sno%s' "$YELLOW" "$RESET"; fi; }
-    printf '\n%s%s  Plan%s\n' "$BOLD" "$CYAN" "$RESET"
-    printf '   %-34s %s\n' "System update"          "$(yn $DO_UPDATE)"
-    printf '   %-34s %s\n' "SSH hardening"          "$($DO_SSH && echo "${GREEN}yes → ${TARGET_USER}${RESET} (${#SSH_KEYS[@]} new key(s))" || yn false)"
-    printf '   %-34s %s\n' "UFW"                    "$($DO_UFW && echo "${GREEN}yes${RESET}${SSH_ALLOW_CIDR:+ (SSH from ${SSH_ALLOW_CIDR})}" || yn false)"
-    printf '   %-34s %s\n' "Fail2Ban"               "$(yn $DO_FAIL2BAN)"
-    printf '   %-34s %s\n' "Automatic security updates" "$(yn $DO_AUTOUPDATE)"
-    printf '   %-34s %s\n' "Kernel hardening"       "$(yn $DO_KERNEL)"
-    printf '   %-34s %s\n' "auditd"                 "$(yn $DO_AUDIT)"
-    printf '   %-34s %s\n' "Cleanup"                "$($DO_CLEANUP && echo "${GREEN}pkgs ${#PKGS_TO_REMOVE[@]}, svcs ${#SVCS_TO_DISABLE[@]}${RESET}" || yn false)"
-    printf '   %-34s %s\n' "Auto-revert timer"      "$($DO_REVERT && echo "${GREEN}${REVERT_MIN} min${RESET}" || yn false)"
-    printf '   %-34s %s\n\n' "Reboot"               "$(yn $DO_REBOOT)"
-    ask "Proceed?" || { echo "Aborted."; exit 0; }
-}
+clear
+echo -e "${BOLD}${CYAN}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║   RPi 5 · Ubuntu 24.04 · NVMe Boot Installer   ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+echo -e "  Running on: ${BOLD}${MODEL}${RESET}"
+echo
+warn "This script will ERASE the NVMe drive completely."
+warn "Make sure you have no important data on it."
+echo
+pause
 
 # =============================================================================
-# PHASE 2 · EXECUTION
+# 1 · DEPENDENCIES
 # =============================================================================
-apt_install() { DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq "$@"; }
+section "1 · Installing Dependencies"
 
-do_update() {
-    section "System update"
+DEPS=(rpi-eeprom wget xz-utils parted udev)
+MISSING=()
+for dep in "${DEPS[@]}"; do
+    dpkg -l "$dep" &>/dev/null 2>&1 || MISSING+=("$dep")
+done
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    info "Installing: ${MISSING[*]}"
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -y -o Dpkg::Options::=--force-confold full-upgrade
-    apt-get -y autoremove
-    ok "System up to date."
-}
+    apt-get install -y "${MISSING[@]}" -qq
+    ok "Dependencies installed."
+else
+    ok "All dependencies already present."
+fi
 
-ensure_user() {
-    if $CREATE_USER; then
-        adduser --gecos "" "$TARGET_USER"
-        ok "User ${TARGET_USER} created."
-    fi
-    if [[ " $(id -nG "$TARGET_USER") " != *" sudo "* ]]; then
-        usermod -aG sudo "$TARGET_USER"
-        ok "Added ${TARGET_USER} to sudo."
-    fi
-}
+# =============================================================================
+# 2 · EEPROM BOOTLOADER CHECK & UPDATE
+# =============================================================================
+section "2 · EEPROM Bootloader"
+echo "  The RPi 5 needs a recent EEPROM firmware to boot from NVMe."
+echo
 
-install_keys() {
-    local home grp ak k
-    home="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
-    grp="$(id -gn "$TARGET_USER")"
-    install -d -m 700 -o "$TARGET_USER" -g "$grp" "${home}/.ssh"
-    ak="${home}/.ssh/authorized_keys"
-    touch "$ak"
-    for k in "${SSH_KEYS[@]}"; do
-        grep -qxF -- "$k" "$ak" || printf '%s\n' "$k" >> "$ak"
-    done
-    chown "${TARGET_USER}:${grp}" "$ak"
-    chmod 600 "$ak"
-    echo "$ak"
-}
+CURRENT_EEPROM=$(rpi-eeprom-update 2>/dev/null | grep "CURRENT:" | awk '{print $2}' || echo "unknown")
+LATEST_EEPROM=$(rpi-eeprom-update 2>/dev/null | grep "LATEST:"  | awk '{print $2}' || echo "unknown")
 
-verify_sshd_effective() {
-    local out; out="$(sshd -T 2>/dev/null)" || return 1
-    grep -qix 'passwordauthentication no' <<<"$out" && grep -qix 'permitrootlogin no' <<<"$out"
-}
+info "Current EEPROM: ${CURRENT_EEPROM}"
+info "Latest EEPROM:  ${LATEST_EEPROM}"
+echo
 
-arm_revert() {
-    section "Arming auto-revert (${REVERT_MIN} min)"
-    render_revert_script > "$REVERT_SCRIPT"
-    chmod 700 "$REVERT_SCRIPT"
-    systemctl stop "${REVERT_UNIT}.timer" "${REVERT_UNIT}.service" 2>/dev/null || true
-    systemd-run --quiet --unit="$REVERT_UNIT" --on-active="${REVERT_MIN}m" "$REVERT_SCRIPT"
-    ok "SSH/UFW changes roll back in ${REVERT_MIN} min unless you run: sudo systemctl stop ${REVERT_UNIT}.timer"
-}
-
-do_ssh() {
-    section "SSH hardening"
-    [[ -x /usr/sbin/sshd ]] || apt_install openssh-server
-    mkdir -p /run/sshd "$BACKUP_DIR"
-    cp -a /etc/ssh "${BACKUP_DIR}/ssh"
-    ensure_user
-
-    local ak n
-    ak="$(install_keys)"
-    n="$(count_keys_in_file "$ak")"
-    if (( n < 1 )); then
-        warn "${ak} has no readable key – NOT touching sshd config."
-        DO_SSH=false
-        return 0
-    fi
-    ok "${n} key(s) in ${ak}."
-
-    render_sshd_dropin > "${SSH_DROPIN}.new"
-    install -m 644 "${SSH_DROPIN}.new" "$SSH_DROPIN"
-    rm -f "${SSH_DROPIN}.new"
-
-    if ! sshd -t; then
-        warn "sshd -t failed – removing drop-in, nothing changed."
-        rm -f "$SSH_DROPIN"; DO_SSH=false; return 0
-    fi
-    if ! verify_sshd_effective; then
-        warn "Another setting overrides the drop-in (sshd -T still allows passwords/root):"
-        grep -rniE 'PasswordAuthentication|PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ || true
-        rm -f "$SSH_DROPIN"; DO_SSH=false; return 0
-    fi
-
-    systemctl reload "$SSH_SVC" 2>/dev/null || systemctl restart "$SSH_SVC"
-    ok "sshd reloaded; effective config verified (no root login, no passwords)."
-}
-
-do_ufw() {
-    section "UFW firewall"
-    apt_install ufw
-    ufw default deny incoming  >/dev/null
-    ufw default allow outgoing >/dev/null
-
-    local p
-    for p in $(detect_ssh_ports); do
-        if [[ -n "$SSH_ALLOW_CIDR" ]]; then
-            ufw allow from "$SSH_ALLOW_CIDR" to any port "$p" proto tcp comment 'SSH' >/dev/null
-        else
-            ufw allow "${p}/tcp" comment 'SSH' >/dev/null
+if [[ "$CURRENT_EEPROM" == "$LATEST_EEPROM" ]]; then
+    ok "EEPROM is already up to date."
+else
+    warn "An EEPROM update is available."
+    if ask "Update EEPROM firmware now? (recommended – requires reboot after)"; then
+        # Use the stable release channel
+        if [[ -f /etc/default/rpi-eeprom-update ]]; then
+            sed -i 's/FIRMWARE_RELEASE_STATUS=.*/FIRMWARE_RELEASE_STATUS=stable/' \
+                /etc/default/rpi-eeprom-update
         fi
-        ok "SSH allowed on ${p}/tcp${SSH_ALLOW_CIDR:+ from ${SSH_ALLOW_CIDR}}."
+        rpi-eeprom-update -a
+        ok "EEPROM update staged."
+        warn "A reboot is needed to apply the EEPROM update."
+        warn "After reboot, re-run this script to continue NVMe setup."
+        if ask "Reboot now to apply EEPROM update?"; then
+            reboot
+        else
+            warn "Continuing without EEPROM update – NVMe boot may not work on older firmware."
+        fi
+    else
+        warn "Skipping EEPROM update – NVMe boot may not work on older firmware."
+    fi
+fi
+
+# =============================================================================
+# 3 · DETECT NVME DRIVE
+# =============================================================================
+section "3 · Detect NVMe Drive"
+
+# Refresh udev so new devices are visible
+udevadm settle
+
+NVME_DEVICES=()
+while IFS= read -r dev; do
+    NVME_DEVICES+=("$dev")
+done < <(lsblk -d -o NAME,TYPE | awk '$2=="disk" && $1~/^nvme/ {print "/dev/"$1}')
+
+if [[ ${#NVME_DEVICES[@]} -eq 0 ]]; then
+    err "No NVMe drive detected. Check that the HAT is seated properly and the drive is connected."
+fi
+
+if [[ ${#NVME_DEVICES[@]} -eq 1 ]]; then
+    NVME_DEV="${NVME_DEVICES[0]}"
+    NVME_SIZE=$(lsblk -d -o SIZE "$NVME_DEV" | tail -1 | tr -d ' ')
+    info "Found NVMe drive: ${BOLD}${NVME_DEV}${RESET} (${NVME_SIZE})"
+    ask "Use ${NVME_DEV} (${NVME_SIZE}) as the target?" || err "Aborted by user."
+else
+    echo "  Multiple NVMe drives detected:"
+    for i in "${!NVME_DEVICES[@]}"; do
+        SIZE=$(lsblk -d -o SIZE "${NVME_DEVICES[$i]}" | tail -1 | tr -d ' ')
+        echo "    $((i+1))) ${NVME_DEVICES[$i]}  (${SIZE})"
     done
-    $UFW_HTTP  && { ufw allow 80/tcp  comment 'HTTP'  >/dev/null; ok "HTTP allowed."; }
-    $UFW_HTTPS && { ufw allow 443/tcp comment 'HTTPS' >/dev/null; ok "HTTPS allowed."; }
-    for p in "${UFW_PORTS[@]}"; do ufw allow "$p" >/dev/null; ok "Allowed ${p}."; done
-    if $UFW_INCUS; then
-        ufw allow in on incusbr0       >/dev/null
-        ufw route allow in on incusbr0  >/dev/null
-        ufw route allow out on incusbr0 >/dev/null
-        ok "Incus bridge rules added (incusbr0)."
-    fi
-    ufw --force enable >/dev/null
-    ok "UFW enabled."
-}
-
-do_fail2ban() {
-    section "Fail2Ban"
-    apt_install fail2ban
-    render_fail2ban > /etc/fail2ban/jail.local
-    systemctl enable --now fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban
-    ok "Fail2Ban active (sshd jail)."
-}
-
-do_autoupdate() {
-    section "Automatic security updates"
-    apt_install unattended-upgrades apt-listchanges
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
-    cat > /etc/apt/apt.conf.d/52bt-unattended <<'EOF'
-// Security origins are already enabled in 50unattended-upgrades on Ubuntu.
-// Never reboot a colo box by surprise; kernel updates wait for you.
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-EOF
-    systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
-    ok "Security updates automatic; reboots stay manual (check /var/run/reboot-required)."
-}
-
-do_kernel() {
-    section "Kernel hardening"
-    render_sysctl > /etc/sysctl.d/99-bt-hardening.conf
-    sysctl --system >/dev/null
-    ok "sysctl applied (/etc/sysctl.d/99-bt-hardening.conf)."
-}
-
-do_audit() {
-    section "auditd"
-    apt_install auditd audispd-plugins
-    render_audit_rules > /etc/audit/rules.d/99-bt-hardening.rules
-    systemctl enable --now auditd >/dev/null 2>&1
-    augenrules --load >/dev/null 2>&1 || true
-    ok "auditd running with the small rule set."
-}
-
-do_cleanup() {
-    section "Cleanup"
-    if (( ${#PKGS_TO_REMOVE[@]} )); then
-        apt-get purge -y -qq "${PKGS_TO_REMOVE[@]}"
-        apt-get autoremove -y -qq
-        ok "Removed: ${PKGS_TO_REMOVE[*]}"
-    fi
-    local svc
-    for svc in "${SVCS_TO_DISABLE[@]}"; do
-        if systemctl disable --now "$svc" >/dev/null 2>&1; then ok "Disabled ${svc}"; else warn "Could not disable ${svc}"; fi
+    while true; do
+        echo -en "${BOLD}[?]${RESET} Select drive number: "
+        read -r SEL
+        if [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#NVME_DEVICES[@]} )); then
+            NVME_DEV="${NVME_DEVICES[$((SEL-1))]}"
+            break
+        fi
+        echo "  Invalid selection."
     done
-}
+fi
 
-finish() {
-    section "Done – verify"
-    if $DO_SSH; then
-        echo " Effective sshd settings:"
-        sshd -T 2>/dev/null | grep -E '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|allowusers) ' | sed 's/^/   /' || true
+NVME_SIZE_BYTES=$(lsblk -d -b -o SIZE "$NVME_DEV" | tail -1 | tr -d ' ')
+NVME_SIZE_GB=$(( NVME_SIZE_BYTES / 1024 / 1024 / 1024 ))
+ok "Target: ${NVME_DEV} (${NVME_SIZE_GB} GB)"
+
+# Safety: make sure we're not targeting the SD card (mmcblk)
+if echo "$NVME_DEV" | grep -q "mmcblk"; then
+    err "Target looks like an SD/eMMC device, not NVMe. Refusing to continue."
+fi
+
+# Check nothing is mounted from the NVMe
+if mount | grep -q "^${NVME_DEV}"; then
+    warn "Partitions from ${NVME_DEV} are currently mounted:"
+    mount | grep "^${NVME_DEV}" | awk '{print "  "$1" → "$3}'
+    if ask "Unmount them now?"; then
+        mount | grep "^${NVME_DEV}" | awk '{print $3}' | xargs -r umount -l
+        ok "Unmounted."
+    else
+        err "Cannot write to a mounted drive. Aborting."
     fi
-    $DO_UFW && { echo " UFW:"; ufw status | sed 's/^/   /'; }
-    $DO_FAIL2BAN && { echo " Fail2Ban:"; fail2ban-client status sshd 2>/dev/null | sed 's/^/   /' || true; }
-    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
-        warn "Clock is not NTP-synchronised (check: timedatectl; apt install chrony)."
+fi
+
+# =============================================================================
+# 4 · PARTITION LAYOUT
+# =============================================================================
+section "4 · Partition Layout"
+echo "  The installer will create:"
+echo "    • /dev/$(basename ${NVME_DEV})p1  – 512 MB  FAT32  (boot / firmware)"
+echo "    • /dev/$(basename ${NVME_DEV})p2  – remainder  ext4  (root / Ubuntu)"
+echo
+
+# Optional: custom root size
+ROOT_SIZE="max"
+if ask "Use a custom root partition size instead of the full remaining disk?"; then
+    while true; do
+        echo -en "${BOLD}[?]${RESET} Root partition size in GB (max ${NVME_SIZE_GB}): "
+        read -r ROOT_GB
+        if [[ "$ROOT_GB" =~ ^[0-9]+$ ]] && (( ROOT_GB >= 4 && ROOT_GB < NVME_SIZE_GB )); then
+            ROOT_SIZE="${ROOT_GB}GB"
+            break
+        fi
+        echo "  Enter a number between 4 and $((NVME_SIZE_GB - 1))."
+    done
+fi
+
+# =============================================================================
+# 5 · UBUNTU IMAGE
+# =============================================================================
+section "5 · Ubuntu 24.04 Image"
+
+IMAGE_FILENAME="ubuntu-24.04.4-preinstalled-server-arm64+raspi.img.xz"
+IMAGE_CACHE_DIR="/var/cache/rpi-nvme-install"
+IMAGE_PATH="${IMAGE_CACHE_DIR}/${IMAGE_FILENAME}"
+IMAGE_EXTRACTED="${IMAGE_CACHE_DIR}/ubuntu-24.04.4-preinstalled-server-arm64+raspi.img"
+SHA256_EXPECTED="790652faeb4f61ce7bb12f5cb61734595c61d3cd882915b8b5f9918106c80d37"
+
+# Mirrors tried in order (EU first, canonical fallback)
+IMAGE_URLS=(
+    "https://ftp.cvut.cz/ubuntu-releases/noble/${IMAGE_FILENAME}"
+    "https://mirrors.nic.cz/ubuntu-releases/noble/${IMAGE_FILENAME}"
+    "https://cdimage.ubuntu.com/releases/noble/release/${IMAGE_FILENAME}"
+)
+
+mkdir -p "$IMAGE_CACHE_DIR"
+
+echo "  Source: Ubuntu 24.04.4 LTS – preinstalled server – ARM64 (Raspberry Pi)"
+echo
+
+# ── Decide whether to download ────────────────────────────────────────────────
+SKIP_DOWNLOAD=false
+ALREADY_DOWNLOADED=false
+
+if [[ -f "$IMAGE_EXTRACTED" ]]; then
+    IMG_SIZE=$(du -h "$IMAGE_EXTRACTED" | cut -f1)
+    info "Found existing extracted image: ${IMAGE_EXTRACTED} (${IMG_SIZE})"
+    if ask "Use existing image? (No = re-download)"; then
+        SKIP_DOWNLOAD=true
+    else
+        rm -f "$IMAGE_EXTRACTED" "$IMAGE_PATH"
     fi
-    [[ -f /var/run/reboot-required ]] && warn "Reboot required (kernel/libs updated) – do it when you can."
-    printf '\n%s%sNEXT:%s open a NEW terminal and run:  ssh %s@<server-ip>\n' "$BOLD" "$GREEN" "$RESET" "${TARGET_USER:-<user>}"
-    if $DO_REVERT; then
-        printf '  works?  cancel the rollback:  sudo systemctl stop %s.timer\n' "$REVERT_UNIT"
-        printf '  broken? do nothing – in %s min SSH drop-in is removed and UFW disabled.\n' "$REVERT_MIN"
+elif [[ -f "$IMAGE_PATH" ]]; then
+    info "Found existing compressed image: ${IMAGE_PATH}"
+    if ask "Use and extract existing download? (No = re-download)"; then
+        ALREADY_DOWNLOADED=true
+    else
+        rm -f "$IMAGE_PATH"
     fi
-    echo "  Log: ${LOG}   Backups: ${BACKUP_DIR}"
-    echo "  Manual rollback: rm ${SSH_DROPIN}; systemctl reload ${SSH_SVC}; ufw disable"
-}
+fi
 
-execute() {
-    mkdir -p "$BACKUP_DIR"
-    exec > >(tee -a "$LOG") 2>&1
-    SSH_SVC="$(detect_ssh_svc)"
-    echo "== BTSetup hardening v${VERSION} ${STAMP} =="
+# ── Download ──────────────────────────────────────────────────────────────────
+if [[ "$SKIP_DOWNLOAD" == false && "$ALREADY_DOWNLOADED" == false ]]; then
+    DOWNLOAD_OK=false
+    for URL in "${IMAGE_URLS[@]}"; do
+        info "Trying: ${URL}"
+        if wget -4 --show-progress --timeout=30 --tries=2 -O "$IMAGE_PATH" "$URL"; then
+            ok "Download complete."
+            DOWNLOAD_OK=true
+            break
+        else
+            warn "Failed. Trying next mirror…"
+            rm -f "$IMAGE_PATH"
+        fi
+    done
+    [[ "$DOWNLOAD_OK" == true ]] || err "All mirrors failed. Check internet connection and try again."
+fi
 
-    $DO_UPDATE && do_update
-    if $DO_REVERT; then arm_revert; fi
-    $DO_SSH       && do_ssh
-    $DO_UFW       && do_ufw
-    $DO_FAIL2BAN  && do_fail2ban
-    $DO_AUTOUPDATE && do_autoupdate
-    $DO_KERNEL    && do_kernel
-    $DO_AUDIT     && do_audit
-    $DO_CLEANUP   && do_cleanup
-    finish
-
-    if $DO_REBOOT; then
-        info "Rebooting in 10 seconds (Ctrl+C to abort)…"
-        sleep 10
-        systemctl reboot
+# ── Verify checksum ───────────────────────────────────────────────────────────
+if [[ "$SKIP_DOWNLOAD" == false ]]; then
+    info "Verifying SHA256 checksum…"
+    ACTUAL=$(sha256sum "$IMAGE_PATH" | awk '{print $1}')
+    if [[ "$ACTUAL" == "$SHA256_EXPECTED" ]]; then
+        ok "Checksum verified."
+    else
+        err "Checksum mismatch! Image may be corrupt. Delete ${IMAGE_PATH} and retry."
     fi
-    return 0
-}
 
-main() {
-    trap 'err_trap $LINENO' ERR
-    plan
-    execute
-}
+    # ── Extract ───────────────────────────────────────────────────────────────
+    info "Extracting image (this takes a few minutes)…"
+    xz --decompress --threads=0 "$IMAGE_PATH"   # consumes .xz, writes .img in place
+    mv "${IMAGE_PATH%.xz}" "$IMAGE_EXTRACTED" 2>/dev/null || true
+    ok "Image extracted: ${IMAGE_EXTRACTED}"
+fi
 
-# Allow `source`-ing for tests without running anything.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
+# ── Size check ────────────────────────────────────────────────────────────────
+IMG_SIZE_BYTES=$(stat -c%s "$IMAGE_EXTRACTED")
+IMG_SIZE_GB=$(echo "scale=1; ${IMG_SIZE_BYTES}/1024/1024/1024" | bc)
+info "Image size: ${IMG_SIZE_GB} GB"
+
+if (( IMG_SIZE_BYTES > NVME_SIZE_BYTES )); then
+    err "Image (${IMG_SIZE_GB} GB) is larger than NVMe (${NVME_SIZE_GB} GB). Cannot continue."
+fi
+# =============================================================================
+# 6 · FLASH IMAGE TO NVME
+# =============================================================================
+section "6 · Flash Image to NVMe"
+echo -e "  ${BOLD}${RED}WARNING: This will ERASE all data on ${NVME_DEV}!${RESET}"
+echo
+echo "  Source : ${IMAGE_EXTRACTED}"
+echo "  Target : ${NVME_DEV}"
+echo "  NVMe   : ${NVME_SIZE_GB} GB"
+echo
+
+warn "Last chance to abort before data is written."
+ask "Confirm: erase ${NVME_DEV} and flash Ubuntu 24.04?" || err "Aborted by user."
+
+info "Flashing image to ${NVME_DEV}…"
+info "(This will take several minutes – do not interrupt)"
+
+# Use dd with progress via status=progress
+dd if="$IMAGE_EXTRACTED" of="$NVME_DEV" bs=4M status=progress conv=fsync oflag=direct
+sync
+
+ok "Image flashed successfully."
+
+# Inform kernel of new partition table
+partprobe "$NVME_DEV" 2>/dev/null || true
+udevadm settle
+sleep 2
+
+# =============================================================================
+# 7 · EXPAND ROOT PARTITION TO FILL NVME
+# =============================================================================
+section "7 · Expand Root Partition"
+echo "  The flashed image is ~3–4 GB. Expanding root to fill the NVMe…"
+echo
+
+# Partition names: nvme0n1p1, nvme0n1p2 etc.
+PART_BOOT="${NVME_DEV}p1"
+PART_ROOT="${NVME_DEV}p2"
+
+if ask "Expand root partition to fill the NVMe now?"; then
+    # Get the start sector of partition 2
+    ROOT_START=$(parted -s "$NVME_DEV" unit s print | awk '/^ 2/{print $2}' | tr -d 's')
+
+    if [[ "$ROOT_SIZE" == "max" ]]; then
+        END_SECTOR="100%"
+    else
+        # Convert GB to sectors (512 byte sectors)
+        END_BYTES=$(( ${ROOT_SIZE%GB} * 1024 * 1024 * 1024 ))
+        END_SECTOR=$(( ROOT_START + END_BYTES / 512 - 1 ))
+    fi
+
+    parted -s "$NVME_DEV" resizepart 2 "$END_SECTOR"
+    partprobe "$NVME_DEV"
+    udevadm settle
+    sleep 2
+
+    info "Resizing ext4 filesystem on ${PART_ROOT}…"
+    e2fsck -f -y "$PART_ROOT" || true
+    resize2fs "$PART_ROOT"
+    ok "Root partition expanded."
+    lsblk "$NVME_DEV"
+else
+    warn "Root partition not expanded. Ubuntu will use only ~3–4 GB."
+    warn "You can expand later with: sudo raspi-config → Advanced → Expand Filesystem"
+fi
+
+# =============================================================================
+# 8 · CONFIGURE NVME BOOT ORDER IN EEPROM
+# =============================================================================
+section "8 · Set EEPROM Boot Order to NVMe"
+echo "  The RPi 5 EEPROM boot order controls which device is tried first."
+echo "  Current EEPROM config:"
+echo
+
+rpi-eeprom-config | grep BOOT_ORDER || true
+echo
+
+echo "  Boot order codes (hex, right-to-left priority):"
+echo "    0x1 = SD card"
+echo "    0x4 = USB mass storage"
+echo "    0x6 = NVMe"
+echo "    0xf = Restart loop"
+echo
+echo "  Recommended: 0xf16  =  NVMe first → USB → restart"
+echo "               0xf16  =  try NVMe, fallback USB, restart if all fail"
+echo "               0xf61  =  SD first → USB → NVMe (safe fallback)"
+echo
+
+if ask "Set boot order to NVMe-first (0xf16)?"; then
+    BOOT_ORDER="0xf16"
+
+    # Write updated EEPROM config
+    TMPCONF=$(mktemp)
+    rpi-eeprom-config > "$TMPCONF"
+
+    if grep -q "BOOT_ORDER" "$TMPCONF"; then
+        sed -i "s/^BOOT_ORDER=.*/BOOT_ORDER=${BOOT_ORDER}/" "$TMPCONF"
+    else
+        echo "BOOT_ORDER=${BOOT_ORDER}" >> "$TMPCONF"
+    fi
+
+    rpi-eeprom-config --apply "$TMPCONF"
+    rm -f "$TMPCONF"
+    ok "EEPROM boot order set to ${BOOT_ORDER} (NVMe first)."
+    warn "This takes effect on next boot."
+else
+    warn "Boot order not changed. The RPi may still boot from SD card."
+    warn "You can change it later with: sudo rpi-eeprom-config --edit"
+fi
+
+
+# =============================================================================
+# 8b · NVMe First-Boot Configuration (static IP + SSH password auth)
+# =============================================================================
+section "8b · First-Boot Configuration"
+echo "  Mounts the NVMe root partition to configure:"
+echo "    • Static IP via netplan"
+echo "    • SSH password authentication via cloud-init"
+echo
+
+# Decide what to configure
+DO_STATIC_IP=false
+DO_SSH_PASSWORD=false
+
+if ask "Configure a static IP on the NVMe?"; then
+    DO_STATIC_IP=true
+fi
+
+if ask "Enable SSH password authentication on first boot?"; then
+    DO_SSH_PASSWORD=true
+    warn "Password auth is convenient but less secure."
+    warn "Remember to run harden.sh after first login to lock it back down."
+fi
+
+if $DO_STATIC_IP || $DO_SSH_PASSWORD; then
+
+    # ── Mount NVMe root ───────────────────────────────────────────────────────
+    NVME_MOUNT=$(mktemp -d)
+    mount "${NVME_DEV}p2" "$NVME_MOUNT" \
+        || err "Could not mount NVMe root partition."
+
+    # Also mount boot partition (needed for cloud-init user-data)
+    NVME_BOOT="${NVME_MOUNT}/boot/firmware"
+    mkdir -p "$NVME_BOOT"
+    mount "${NVME_DEV}p1" "$NVME_BOOT" 2>/dev/null || true
+
+    # ── Static IP ─────────────────────────────────────────────────────────────
+    if $DO_STATIC_IP; then
+        echo
+        info "Network interfaces detected on this system:"
+        while IFS= read -r iface; do
+            [[ "$iface" == "lo" ]] && continue
+            STATE=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "unknown")
+            MAC=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "??:??:??:??:??:??")
+            printf "    %-12s  state: %-8s  mac: %s\n" "$iface" "$STATE" "$MAC"
+        done < <(ls /sys/class/net/)
+        echo
+        warn "On RPi 5 with Ubuntu 24.04 the ethernet port is usually 'end0'."
+        echo
+
+        while true; do
+            echo -en "${BOLD}[?]${RESET} Interface name (e.g. end0, eth0): "
+            read -r NET_IFACE
+            [[ -n "$NET_IFACE" ]] && break
+            echo "  Cannot be empty."
+        done
+
+        while true; do
+            echo -en "${BOLD}[?]${RESET} Static IP address (e.g. 192.168.1.100): "
+            read -r NET_IP
+            [[ "$NET_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+            echo "  Invalid IP format."
+        done
+
+        while true; do
+            echo -en "${BOLD}[?]${RESET} Prefix length [24]: "
+            read -r NET_PREFIX
+            NET_PREFIX="${NET_PREFIX:-24}"
+            [[ "$NET_PREFIX" =~ ^[0-9]+$ ]] && (( NET_PREFIX >= 1 && NET_PREFIX <= 32 )) && break
+            echo "  Enter a number between 1 and 32."
+        done
+
+        SUGGESTED_GW=$(echo "$NET_IP" | awk -F. '{print $1"."$2"."$3".1"}')
+        while true; do
+            echo -en "${BOLD}[?]${RESET} Default gateway [${SUGGESTED_GW}]: "
+            read -r NET_GW
+            NET_GW="${NET_GW:-$SUGGESTED_GW}"
+            [[ "$NET_GW" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+            echo "  Invalid gateway format."
+        done
+
+        NET_DNS="$NET_GW"
+
+        echo
+        echo -e "  ${BOLD}Netplan summary:${RESET}"
+        echo "    Interface : ${NET_IFACE}"
+        echo "    IP        : ${NET_IP}/${NET_PREFIX}"
+        echo "    Gateway   : ${NET_GW}"
+        echo "    DNS       : ${NET_DNS} (gateway)"
+        echo
+
+        NETPLAN_DIR="${NVME_MOUNT}/etc/netplan"
+        mkdir -p "$NETPLAN_DIR"
+
+        # Disable existing DHCP configs
+        for f in "${NETPLAN_DIR}"/*.yaml; do
+            [[ -f "$f" ]] && mv "$f" "${f}.disabled" && \
+                info "Disabled existing netplan: $(basename $f)"
+        done
+
+        cat > "${NETPLAN_DIR}/01-static.yaml" << EOF
+network:
+  version: 2
+  ethernets:
+    ${NET_IFACE}:
+      dhcp4: false
+      addresses:
+        - ${NET_IP}/${NET_PREFIX}
+      routes:
+        - to: default
+          via: ${NET_GW}
+      nameservers:
+        addresses:
+          - ${NET_DNS}
+EOF
+        chmod 600 "${NETPLAN_DIR}/01-static.yaml"
+        ok "Static IP config written: /etc/netplan/01-static.yaml"
+    fi
+
+    # ── SSH password auth via cloud-init ──────────────────────────────────────
+    if $DO_SSH_PASSWORD; then
+        echo
+        # Set a password for the ubuntu user
+        while true; do
+            echo -en "${BOLD}[?]${RESET} Password for the 'ubuntu' user on first boot: "
+            read -rs SSH_PASS
+            echo
+            echo -en "${BOLD}[?]${RESET} Confirm password: "
+            read -rs SSH_PASS2
+            echo
+            [[ "$SSH_PASS" == "$SSH_PASS2" && -n "$SSH_PASS" ]] && break
+            echo "  Passwords do not match or are empty. Try again."
+        done
+
+        # Hash the password for cloud-init (SHA-512)
+        if command -v openssl &>/dev/null; then
+            HASHED_PASS=$(openssl passwd -6 "$SSH_PASS")
+        elif command -v python3 &>/dev/null; then
+            HASHED_PASS=$(python3 -c "import crypt,getpass; print(crypt.crypt('${SSH_PASS}', crypt.mksalt(crypt.METHOD_SHA512)))")
+        else
+            err "Cannot hash password: neither openssl nor python3 found."
+        fi
+
+        # Write cloud-init user-data to the boot partition
+        USERDATA="${NVME_BOOT}/user-data"
+
+        # Backup existing user-data
+        [[ -f "$USERDATA" ]] && cp "$USERDATA" "${USERDATA}.bak" && \
+            info "Backed up existing user-data to user-data.bak"
+
+        cat > "$USERDATA" << EOF
+#cloud-config
+
+# Enable SSH password authentication
+ssh_pwauth: true
+
+# Set password for default ubuntu user
+users:
+  - name: ubuntu
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    passwd: ${HASHED_PASS}
+
+# Allow password login (overrides Ubuntu's default deny)
+chpasswd:
+  expire: false
+EOF
+        ok "cloud-init user-data written: SSH password auth enabled."
+        info "Login on first boot: ubuntu / <your password>"
+    fi
+
+    # ── Unmount ───────────────────────────────────────────────────────────────
+    umount "$NVME_BOOT" 2>/dev/null || true
+    umount "$NVME_MOUNT" 2>/dev/null || true
+    rmdir "$NVME_MOUNT"
+
+else
+    skip "First-boot configuration"
+fi
+
+# =============================================================================
+# 9 · VERIFY
+# =============================================================================
+section "9 · Verification"
+
+echo "  Partition layout on ${NVME_DEV}:"
+lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$NVME_DEV"
+echo
+
+# Mount and spot-check the NVMe root
+MOUNT_POINT=$(mktemp -d)
+MOUNT_BOOT="${MOUNT_POINT}/boot/firmware"
+
+info "Mounting NVMe root for verification…"
+mount "$PART_ROOT" "$MOUNT_POINT"
+mount "$PART_BOOT" "$MOUNT_BOOT" 2>/dev/null || \
+    mount "${NVME_DEV}p1" "${MOUNT_POINT}/boot" 2>/dev/null || true
+
+echo
+echo "  NVMe root contents (spot check):"
+ls "$MOUNT_POINT" | tr '\n' '  '
+echo
+
+if [[ -f "${MOUNT_POINT}/etc/os-release" ]]; then
+    echo
+    info "OS on NVMe:"
+    grep PRETTY_NAME "${MOUNT_POINT}/etc/os-release" | sed 's/PRETTY_NAME=/  /'
+    ok "Ubuntu installation verified on NVMe."
+else
+    warn "Could not find /etc/os-release on NVMe. Flash may have failed."
+fi
+
+# Check cmdline.txt on boot partition
+if [[ -f "${MOUNT_BOOT}/cmdline.txt" ]]; then
+    info "Boot cmdline.txt: $(cat ${MOUNT_BOOT}/cmdline.txt)"
+fi
+
+umount -R "$MOUNT_POINT" 2>/dev/null || true
+rmdir "$MOUNT_POINT"
+
+# =============================================================================
+# SUMMARY
+# =============================================================================
+echo
+echo -e "${BOLD}${GREEN}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║              Installation Complete!             ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+
+echo -e "${BOLD}What to do next:${RESET}"
+echo
+echo "  1. Power off the RPi 5:"
+echo "       sudo poweroff"
+echo
+echo "  2. Remove the SD card"
+echo
+echo "  3. Power on – the RPi 5 will boot Ubuntu 24.04 from NVMe"
+echo
+echo "  4. First boot may take 60–90 seconds (cloud-init runs)"
+echo
+echo "  5. Default login: ubuntu / ubuntu  (you'll be prompted to change it)"
+echo
+echo "  6. After first login, verify you're on NVMe:"
+echo "       lsblk | grep -E 'nvme|NAME'"
+echo "       findmnt / "
+echo
+echo -e "${BOLD}Optional – if boot fails:${RESET}"
+echo "  • Re-insert SD card, boot into it, and run:"
+echo "      sudo rpi-eeprom-config --edit"
+echo "    Set BOOT_ORDER=0xf61 (NVMe after SD) to debug"
+echo "  • Check NVMe HAT PCIe speed: some HATs need the SD to set pciex1_gen=3 in config.txt"
+echo "    (RPi 5 defaults to Gen 2; set in /boot/firmware/config.txt on NVMe)"
+echo
+echo -e "  ${CYAN}PCIe Gen 3 (optional, faster):${RESET}"
+echo "  Mount NVMe boot partition and add to config.txt:"
+echo "    dtparam=pciex1_gen=3"
+echo
+
+if ask "Power off now to remove SD card and boot from NVMe?"; then
+    info "Powering off in 3 seconds…"
+    sleep 3
+    poweroff
 fi
